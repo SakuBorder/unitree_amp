@@ -6,6 +6,10 @@ import numpy as np
 from legged_gym import LEGGED_GYM_ROOT_DIR
 import torch
 import yaml
+import os
+import shutil
+
+from torch.utils.tensorboard import SummaryWriter
 
 
 def get_gravity_orientation(quaternion):
@@ -68,6 +72,12 @@ if __name__ == "__main__":
 
     counter = 0
 
+    # TensorBoard
+    log_dir = config.get("log_dir", "debug/mujoco")
+    if os.path.exists(log_dir):
+        shutil.rmtree(log_dir)
+    writer = SummaryWriter(log_dir=log_dir)
+
     # Load robot model
     m = mujoco.MjModel.from_xml_path(xml_path)
     d = mujoco.MjData(m)
@@ -81,26 +91,25 @@ if __name__ == "__main__":
         start = time.time()
         while viewer.is_running() and time.time() - start < simulation_duration:
             step_start = time.time()
-            tau = pd_control(target_dof_pos, d.qpos[7:], kps, np.zeros_like(kds), d.qvel[6:], kds)
+
+            # 当前关节角（只取你控制的12个自由度）
+            qj_now = d.qpos[7:7+num_actions]
+            dqj_now = d.qvel[6:6+num_actions]
+
+            tau = pd_control(target_dof_pos, qj_now, kps, np.zeros_like(kds), dqj_now, kds)
             d.ctrl[:] = tau
-            # mj_step can be replaced with code that also evaluates
-            # a policy and applies a control signal before stepping the physics.
+
+            # Step physics
             mujoco.mj_step(m, d)
 
             counter += 1
             if counter % control_decimation == 0:
-                # Apply control signal here.
-
-                # create observation
-                qj = d.qpos[7:]
-                dqj = d.qvel[6:]
+                # 构造观测
+                qj = (qj_now - default_angles) * dof_pos_scale
+                dqj = dqj_now * dof_vel_scale
                 quat = d.qpos[3:7]
-                omega = d.qvel[3:6]
-
-                qj = (qj - default_angles) * dof_pos_scale
-                dqj = dqj * dof_vel_scale
+                omega = d.qvel[3:6] * ang_vel_scale
                 gravity_orientation = get_gravity_orientation(quat)
-                omega = omega * ang_vel_scale
 
                 period = 0.8
                 count = counter * simulation_dt
@@ -114,12 +123,53 @@ if __name__ == "__main__":
                 obs[9 : 9 + num_actions] = qj
                 obs[9 + num_actions : 9 + 2 * num_actions] = dqj
                 obs[9 + 2 * num_actions : 9 + 3 * num_actions] = action
-                obs[9 + 3 * num_actions : 9 + 3 * num_actions + 2] = np.array([sin_phase, cos_phase])
+                obs[9 + 3 * num_actions : 9 + 3 * num_actions + 2] = np.array([sin_phase, cos_phase], dtype=np.float32)
+
                 obs_tensor = torch.from_numpy(obs).unsqueeze(0)
+
                 # policy inference
                 action = policy(obs_tensor).detach().numpy().squeeze()
+
                 # transform action to target_dof_pos
                 target_dof_pos = action * action_scale + default_angles
+
+                # === TensorBoard Logging ===
+                step = counter // control_decimation
+
+                # 1) target pos vs 当前 qj（每关节一张图，两条曲线）
+                for j in range(num_actions):
+                    writer.add_scalars(
+                        f'fig_mujoco/target_vs_qj/j{j}',
+                        {
+                            'target_pos': float(target_dof_pos[j]),
+                            'qj': float(qj_now[j])
+                        },
+                        step
+                    )
+
+                # 2) action 左右对比（0-5 vs 6-11）
+                for j in range(num_actions // 2):
+                    if j + num_actions // 2 < num_actions:
+                        writer.add_scalars(
+                            f'fig_mujoco/action_{j}_vs_{j + num_actions//2}',
+                            {
+                                f'action_{j}': float(action[j]),
+                                f'action_{j + num_actions//2}': float(action[j + num_actions//2])
+                            },
+                            step
+                        )
+
+                # 3) dof 左右对比（当前 qj）
+                for j in range(num_actions // 2):
+                    if j + num_actions // 2 < num_actions:
+                        writer.add_scalars(
+                            f'fig_mujoco/dof_{j}_vs_{j + num_actions//2}',
+                            {
+                                f'dof_{j}': float(qj_now[j]),
+                                f'dof_{j + num_actions//2}': float(qj_now[j + num_actions//2])
+                            },
+                            step
+                        )
 
             # Pick up changes to the physics state, apply perturbations, update options from GUI.
             viewer.sync()

@@ -66,8 +66,7 @@ class G1Robot(LeggedRobot):
     
     
     def compute_observations(self):
-        """ Computes observations
-        """
+        """ Computes observations """
         sin_phase = torch.sin(2 * np.pi * self.phase ).unsqueeze(1)
         cos_phase = torch.cos(2 * np.pi * self.phase ).unsqueeze(1)
         self.obs_buf = torch.cat((  self.base_ang_vel  * self.obs_scales.ang_vel,
@@ -89,10 +88,16 @@ class G1Robot(LeggedRobot):
                                     sin_phase,
                                     cos_phase
                                     ),dim=-1)
-        # add perceptive inputs if not blind
+        
         # add noise if needed
         if self.add_noise:
             self.obs_buf += (2 * torch.rand_like(self.obs_buf) - 1) * self.noise_scale_vec
+
+        # ===== 调试输出 =====
+        if self.episode_length_buf[0] % 100 == 0:  # 每隔100步打印一次，避免太刷屏
+            print(f"[DEBUG] Commanded vel: {self.commands[0,:3].cpu().numpy()} | "
+                f"Actual vel: {self.base_lin_vel[0,:3].cpu().numpy()}")
+
 
         
     def _reward_contact(self):
