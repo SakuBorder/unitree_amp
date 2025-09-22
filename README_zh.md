@@ -45,7 +45,7 @@ python legged_gym/scripts/train.py --task=xxx
 ```
 
 #### ⚙️  参数说明
-- `--task`: 必选参数，值可选(go2, g1, h1, h1_2)
+- `--task`: 必选参数，值可选(go2, g1, g1_amp, h1, h1_2)
 - `--headless`: 默认启动图形界面，设为 true 时不渲染图形界面（效率更高）
 - `--resume`: 从日志中选择 checkpoint 继续训练
 - `--experiment_name`: 运行/加载的 experiment 名称

@@ -45,7 +45,7 @@ python legged_gym/scripts/train.py --task=xxx
 ```
 
 #### ⚙️ Parameter Description
-- `--task`: Required parameter; values can be (go2, g1, h1, h1_2).
+- `--task`: Required parameter; values can be (go2, g1, g1_amp, h1, h1_2).
 - `--headless`: Defaults to starting with a graphical interface; set to true for headless mode (higher efficiency).
 - `--resume`: Resume training from a checkpoint in the logs.
 - `--experiment_name`: Name of the experiment to run/load.
