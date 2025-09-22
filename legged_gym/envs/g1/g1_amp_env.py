@@ -204,7 +204,34 @@ class G1AMPRobot(G1Robot):
         if self._motion_key_body_indices is None:
             raise RuntimeError("Motion key body indices are undefined; check motion library initialisation.")
 
-        key_body_pos = state["rg_pos"][:, self._motion_key_body_indices, :]
+        key_body_pos = state.get("key_pos")
+        if key_body_pos is not None:
+            # Some motion libraries provide dedicated key positions that may
+            # already match the configured body order. If they instead expose
+            # the full rigid-body array, align them with the configured AMP
+            # indices for backwards compatibility.
+            if key_body_pos.shape[1] != len(self.cfg.amp.key_body_names):
+                if self._motion_key_body_indices is None:
+                    raise RuntimeError(
+                        "Motion key body indices are undefined; cannot align key_pos entries."
+                    )
+                if (
+                    key_body_pos.shape[1]
+                    <= int(self._motion_key_body_indices.max().item())
+                ):
+                    raise ValueError(
+                        "Motion key_pos does not cover the configured AMP key bodies."
+                    )
+                key_body_pos = key_body_pos[:, self._motion_key_body_indices, :]
+        if key_body_pos is not None:
+            key_body_pos = torch.as_tensor(key_body_pos, device=self.device)
+        else:
+            if self._motion_key_body_indices is None:
+                raise RuntimeError(
+                    "Motion key body indices are undefined; check motion library initialisation."
+                )
+            key_body_pos = state["rg_pos"][:, self._motion_key_body_indices, :]
+        key_body_pos = key_body_pos.to(self.device)
         obs = build_amp_observations(
             state["root_pos"],
             state["root_rot"],

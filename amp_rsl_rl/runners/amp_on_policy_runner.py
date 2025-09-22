@@ -343,8 +343,10 @@ class AMPOnPolicyRunner:
             start = time.time()
             # Rollout
 
-            mean_style_reward_log = 0
-            mean_task_reward_log = 0
+            mean_style_reward_log = 0.0
+            mean_task_reward_log = 0.0
+            mean_style_reward_weighted_log = 0.0
+            mean_task_reward_weighted_log = 0.0
 
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -387,13 +389,17 @@ class AMPOnPolicyRunner:
                         amp_obs, next_amp_obs, normalizer=self.amp_normalizer
                     )
 
-                    # Track weighted contributions for logging
-                    mean_task_reward_log += (
-                        self.task_reward_weight * rewards.mean().item()
+                    task_reward_mean = rewards.mean().item()
+                    style_reward_mean = style_rewards.mean().item()
+                    mean_task_reward_log += task_reward_mean
+                    mean_style_reward_log += style_reward_mean
+
+                    weighted_task_mean = self.task_reward_weight * task_reward_mean
+                    weighted_style_mean = (
+                        self.style_reward_weight * style_reward_mean
                     )
-                    mean_style_reward_log += (
-                        self.style_reward_weight * style_rewards.mean().item()
-                    )
+                    mean_task_reward_weighted_log += weighted_task_mean
+                    mean_style_reward_weighted_log += weighted_style_mean
 
                     # Combine the task and style rewards only if style rewards are enabled
                     if self.discriminator.reward_scale != 0:
@@ -437,7 +443,11 @@ class AMPOnPolicyRunner:
 
             mean_style_reward_log /= self.num_steps_per_env
             mean_task_reward_log /= self.num_steps_per_env
-            mean_total_reward_log = mean_style_reward_log + mean_task_reward_log
+            mean_style_reward_weighted_log /= self.num_steps_per_env
+            mean_task_reward_weighted_log /= self.num_steps_per_env
+            mean_total_reward_log = (
+                mean_style_reward_weighted_log + mean_task_reward_weighted_log
+            )
 
             (
                 mean_value_loss,
@@ -564,6 +574,16 @@ class AMPOnPolicyRunner:
                 "Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"]
             )
             self.writer.add_scalar(
+                "Train/mean_style_reward_weighted",
+                locs["mean_style_reward_weighted_log"],
+                locs["it"],
+            )
+            self.writer.add_scalar(
+                "Train/mean_task_reward_weighted",
+                locs["mean_task_reward_weighted_log"],
+                locs["it"],
+            )
+            self.writer.add_scalar(
                 "Train/mean_total_reward", locs["mean_total_reward_log"], locs["it"]
             )
             if (
@@ -598,8 +618,10 @@ class AMPOnPolicyRunner:
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
-                f"""{'Mean task reward:':>{pad}} {locs['mean_task_reward_log']:.2f}\n"""
-                f"""{'Mean style reward:':>{pad}} {locs['mean_style_reward_log']:.2f}\n"""
+                f"""{'Mean task reward (raw):':>{pad}} {locs['mean_task_reward_log']:.2f}\n"""
+                f"""{'Mean task reward (weighted):':>{pad}} {locs['mean_task_reward_weighted_log']:.2f}\n"""
+                f"""{'Mean style reward (raw):':>{pad}} {locs['mean_style_reward_log']:.2f}\n"""
+                f"""{'Mean style reward (weighted):':>{pad}} {locs['mean_style_reward_weighted_log']:.2f}\n"""
                 f"""{'Mean total reward:':>{pad}} {locs['mean_total_reward_log']:.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
