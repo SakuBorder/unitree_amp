@@ -134,6 +134,10 @@ def get_args():
         {"name": "--num_envs", "type": int, "help": "Number of environments to create. Overrides config file if provided."},
         {"name": "--seed", "type": int, "help": "Random seed. Overrides config file if provided."},
         {"name": "--max_iterations", "type": int, "help": "Maximum number of training iterations. Overrides config file if provided."},
+        {"name": "--command_lin_vel_x", "type": float, "help": "Override commanded linear velocity along x during play."},
+        {"name": "--command_lin_vel_y", "type": float, "help": "Override commanded linear velocity along y during play."},
+        {"name": "--command_heading", "type": float, "help": "Override commanded heading (rad) during play."},
+        {"name": "--command_yaw_rate", "type": float, "help": "Override commanded yaw rate (rad/s) during play. Disables heading command mode."},
     ]
     # parse arguments
     args = gymutil.parse_arguments(

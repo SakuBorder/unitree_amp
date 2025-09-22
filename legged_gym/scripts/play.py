@@ -14,6 +14,23 @@ import torch
 
 def play(args):
     env_cfg, train_cfg = task_registry.get_cfgs(name=args.task)
+    fixed_commands = []
+    def _set_command_range(name, value):
+        setattr(env_cfg.commands.ranges, name, [value, value])
+        fixed_commands.append((name, value))
+
+    if args.command_lin_vel_x is not None:
+        _set_command_range('lin_vel_x', args.command_lin_vel_x)
+    if args.command_lin_vel_y is not None:
+        _set_command_range('lin_vel_y', args.command_lin_vel_y)
+    if args.command_heading is not None and args.command_yaw_rate is not None:
+        raise ValueError('Cannot set both heading and yaw rate commands at the same time.')
+    if args.command_heading is not None:
+        _set_command_range('heading', args.command_heading)
+    if args.command_yaw_rate is not None:
+        env_cfg.commands.heading_command = False
+        _set_command_range('ang_vel_yaw', args.command_yaw_rate)
+
     # override some parameters for testing
     env_cfg.env.num_envs = min(env_cfg.env.num_envs, 100)
     env_cfg.terrain.num_rows = 5
@@ -24,6 +41,11 @@ def play(args):
     env_cfg.domain_rand.push_robots = False
 
     env_cfg.env.test = True
+
+    if fixed_commands:
+        print('Using fixed commands for play:')
+        for name, value in fixed_commands:
+            print(f'  {name}: {value}')
 
     # prepare environment
     env, _ = task_registry.make_env(name=args.task, args=args, env_cfg=env_cfg)
