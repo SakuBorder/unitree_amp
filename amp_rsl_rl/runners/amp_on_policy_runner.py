@@ -13,6 +13,7 @@ from collections import deque
 from copy import deepcopy
 
 import torch
+from torch.onnx import errors as onnx_errors
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
@@ -220,10 +221,17 @@ class AMPOnPolicyRunner:
         # Log
         self.log_dir = log_dir
         self.writer = None
+        self.logger_type = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        self.export_policy_as_onnx = bool(
+            self.cfg.get(
+                "export_policy_as_onnx",
+                train_cfg.get("export_policy_as_onnx", False),
+            )
+        )
         # Ensure environments are initialised consistently with the base
         # runner implementation.
         if hasattr(self.env, "reset"):
@@ -449,7 +457,10 @@ class AMPOnPolicyRunner:
             if self.log_dir is not None:
                 self.log(locals())
             if self.save_interval and it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
+                self.save(
+                    os.path.join(self.log_dir, f"model_{it}.pt"),
+                    save_onnx=self.export_policy_as_onnx,
+                )
             ep_infos.clear()
             if it == start_iter:
                 # obtain all the diff files
@@ -462,7 +473,7 @@ class AMPOnPolicyRunner:
         self.current_learning_iteration = tot_iter
         self.save(
             os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
-            save_onnx=True,
+            save_onnx=self.export_policy_as_onnx,
         )
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
@@ -663,12 +674,24 @@ class AMPOnPolicyRunner:
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
             onnx_model_name = f"policy_{iteration}.onnx"
 
-            export_policy_as_onnx(
-                self.alg.actor_critic,
-                normalizer=self.obs_normalizer,
-                path=onnx_folder,
-                filename=onnx_model_name,
-            )
+            try:
+                export_policy_as_onnx(
+                    self.alg.actor_critic,
+                    normalizer=self.obs_normalizer,
+                    path=onnx_folder,
+                    filename=onnx_model_name,
+                )
+            except ModuleNotFoundError as exc:
+                print(
+                    f"Warning: skipping ONNX export because a dependency is missing: {exc}"
+                )
+            except onnx_errors.OnnxExporterError as exc:
+                if "Module onnx is not installed" in str(exc):
+                    print(
+                        "Warning: skipping ONNX export because the onnx package is not installed"
+                    )
+                else:
+                    raise
 
             if self.logger_type in ["neptune", "wandb"]:
                 self.writer.save_model(
