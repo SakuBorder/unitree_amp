@@ -1,6 +1,6 @@
 """AMP-enabled environment for the Unitree G1 humanoid."""
 
-import os
+from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
@@ -115,29 +115,39 @@ class G1AMPRobot(G1Robot):
             print("[G1AMP] No motion library specified; AMP demos disabled.")
             return
 
-        motion_file = motion_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
-        if not os.path.isfile(motion_file):
+        motion_path = Path(
+            motion_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        ).expanduser()
+
+        if motion_path.is_dir():
+            if not any(motion_path.glob("*.pkl")):
+                raise FileNotFoundError(
+                    f"No motion library .pkl files found in directory: {motion_path}."
+                )
+        elif not motion_path.is_file():
             raise FileNotFoundError(
-                f"Motion library file not found: {motion_file}. Update cfg.motion_lib.motion_file."
+                f"Motion library file not found: {motion_path}. Update cfg.motion_lib.motion_file."
             )
 
-        mjcf_path = motion_cfg.mjcf_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
-        if not os.path.isfile(mjcf_path):
+        mjcf_path = Path(
+            motion_cfg.mjcf_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        ).expanduser()
+        if not mjcf_path.is_file():
             raise FileNotFoundError(f"MJCF file not found for motion library: {mjcf_path}")
 
         device = torch.device(self.device)
         fix_height = getattr(FixHeightMode, motion_cfg.fix_height_mode)
         self._motion_lib = MotionLibG1(
-            motion_file=motion_file,
+            motion_file=str(motion_path),
             device=device,
             fix_height=fix_height,
             multi_thread=motion_cfg.multi_thread,
-            mjcf_file=mjcf_path,
+            mjcf_file=str(mjcf_path),
             sim_timestep=self.dt,
         )
 
         # Build skeletons for motion loading.
-        skeleton = SkeletonTree.from_mjcf(mjcf_path)
+        skeleton = SkeletonTree.from_mjcf(str(mjcf_path))
         num_motions = min(motion_cfg.num_motions_per_batch, self.num_envs)
         skeletons = [skeleton] * num_motions
         gender_betas = [torch.zeros(17)] * num_motions

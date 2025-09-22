@@ -44,9 +44,7 @@ class G1AMPCfg(G1RoughCfg):
                             "right_hip_pitch_joint",
                             "right_knee_joint",
                             "right_ankle_pitch_joint",
-                            "right_ankle_roll_joint",
-                            "torso_joint",
-                        ]
+                            "right_ankle_roll_joint",                        ]
 
             class feet:
                 class params:
@@ -59,17 +57,19 @@ class G1AMPCfg(G1RoughCfg):
     class motion_lib:
         # Path to the motion library used for AMP demonstrations.  Users
         # should replace this with the path to their processed motion dataset.
-        motion_file = "/home/dy/dy/code/unitree_amp/data/g1_12/walk"
+        motion_file = "/home/dy/dy/code/unitree_amp/data/g1_12/walk/"
         # MJCF description used to build the skeleton that matches the motion
         # library.  The default points to the bundled G1 description.
-        mjcf_file = f"{LEGGED_GYM_ROOT_DIR}/resources/robots/g1_description/g1_12dof.xml"
+        # mjcf_file = f"{LEGGED_GYM_ROOT_DIR}/resources/robots/g1_description/g1_12dof.xml"
+        mjcf_file = "/home/dy/dy/code/unitree_amp/assert/g1/g1_12dof.xml"
+
         # Number of motion clips to load per batch when initialising the
         # library.  Loading every clip can be prohibitively expensive, so a
         # smaller subset keeps start-up times manageable.
         num_motions_per_batch = 256
         # Multi-threaded motion loading improves throughput when many clips are
         # requested.
-        multi_thread = True
+        multi_thread = False
         # G1 motions already include the desired height, so no additional
         # height correction is required.
         fix_height_mode = "no_fix"
@@ -87,6 +87,8 @@ class G1AMPCfgPPO(G1RoughCfgPPO):
     # AMP observations are pre-normalised, so empirical normalisation is not
     # required and would add extra overhead.
     empirical_normalization = False
+    num_steps_per_env = 24  # 直接在顶层添加
+    save_interval = 200
 
     class policy(G1RoughCfgPPO.policy):
         # Explicitly state the policy network class used by the AMP runner.

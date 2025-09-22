@@ -80,7 +80,6 @@ class Humanoid_Batch:
         # print(self.dof_axis)
         self.dof_axis = torch.tensor(self.dof_axis)
         # print(self.dof_axis)
-        
 
         # for extend_config in cfg.extend_config:
         #     self.body_names_augment += [extend_config.joint_name]
@@ -160,12 +159,12 @@ class Humanoid_Batch:
         print(self.num_dof)
         assert(len(joints_range) == self.num_dof)
 
-        print(node_names)
-        print(parent_indices)
-        print(local_translation)
-        print(local_rotation)
-        print(joints_range)
-        print(body_to_joint)
+        # print(node_names)
+        # print(parent_indices)
+        # print(local_translation)
+        # print(local_rotation)
+        # print(joints_range)
+        # print(body_to_joint)
         return {
             "node_names": node_names,
             "parent_indices": torch.from_numpy(np.array(parent_indices, dtype=np.int32)),

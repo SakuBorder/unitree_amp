@@ -167,7 +167,7 @@ class MotionLibBase():
         #     import ipdb; ipdb.set_trace()
         #     self._motion_data_load = joblib.load(self._motion_data_load[0]) # set self._motion_data_load to a sample of the data 
 
-    def setup_constants(self, fix_height = FixHeightMode.full_fix, masterfoot_conifg=None, multi_thread = True):
+    def setup_constants(self, fix_height = FixHeightMode.full_fix, masterfoot_conifg=None, multi_thread = False):
         self._masterfoot_conifg = masterfoot_conifg
         self.fix_height = fix_height
         self.multi_thread = multi_thread

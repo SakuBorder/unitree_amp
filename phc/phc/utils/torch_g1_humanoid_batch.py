@@ -241,7 +241,7 @@ class Humanoid_Batch:
         rotations_world = []
 
         expanded_offsets = (self._offsets[:, None].expand(B, seq_len, J, 3).to(device).type(dtype))
-        # print(expanded_offsets.shape, J)
+        print(expanded_offsets.shape, J)
 
         for i in range(J):
             if self._parents[i] == -1:
