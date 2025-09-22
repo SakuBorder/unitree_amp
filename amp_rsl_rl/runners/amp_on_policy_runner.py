@@ -80,12 +80,11 @@ class AMPOnPolicyRunner:
         self.env = env
 
         # Get the size of the observation space
-        obs, extras = self.env.get_observations()
+        obs = self.env.get_observations()
+        obs_extras = self._require_observation_extras()
         num_obs = obs.shape[1]
-        if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
-        else:
-            num_critic_obs = num_obs
+        critic_tensor = obs_extras.get("critic")
+        num_critic_obs = critic_tensor.shape[1] if critic_tensor is not None else num_obs
         policy_class_name = self.cfg.get(
             "policy_class_name", self.policy_cfg.get("class_name", "ActorCritic")
         )
@@ -118,11 +117,11 @@ class AMPOnPolicyRunner:
         # lazily populated only after the first physics step.  If the buffer is
         # still empty here, trigger a dummy post-physics step to populate it so
         # the normalizer is created with the correct dimensionality.
-        num_amp_obs = extras["observations"]["amp"].shape[1]
+        num_amp_obs = obs_extras["amp"].shape[1]
         if num_amp_obs == 0:
             self.env.post_physics_step()
-            _, extras = self.env.get_observations()
-            num_amp_obs = extras["observations"]["amp"].shape[1]
+            obs_extras = self._require_observation_extras()
+            num_amp_obs = obs_extras["amp"].shape[1]
 
         if not hasattr(self.env, "fetch_amp_obs_demo") or getattr(self.env, "_motion_lib", None) is None:
             raise RuntimeError("Environment must provide MotionLib demos via fetch_amp_obs_demo")
@@ -320,9 +319,10 @@ class AMPOnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs, extras = self.env.get_observations()
-        amp_obs = extras["observations"]["amp"]
-        critic_obs = extras["observations"].get("critic", obs)
+        obs = self.env.get_observations()
+        obs_extras = self._require_observation_extras()
+        amp_obs = obs_extras["amp"]
+        critic_obs = obs_extras.get("critic", obs)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         amp_obs = amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -485,6 +485,27 @@ class AMPOnPolicyRunner:
             os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
             save_onnx=self.export_policy_as_onnx,
         )
+
+    def _require_observation_extras(self, extras: dict | None = None) -> dict:
+        """Retrieve the observation extras dictionary with AMP features."""
+
+        if extras is None:
+            extras = getattr(self.env, "extras", None)
+        if not isinstance(extras, dict):
+            raise KeyError("Environment must expose extras dictionary with AMP observations")
+
+        obs_extras = extras.get("observations")
+        if not isinstance(obs_extras, dict):
+            raise KeyError(
+                "Environment extras must contain an 'observations' dictionary for AMP runner"
+            )
+
+        if "amp" not in obs_extras:
+            raise KeyError(
+                "Environment observations must include AMP features under extras['observations']['amp']"
+            )
+
+        return obs_extras
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
