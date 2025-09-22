@@ -342,14 +342,28 @@ class AMPOnPolicyRunner:
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     self.alg.act_amp(amp_obs)
-                    obs, rewards, dones, infos = self.env.step(actions)
-                    _, extras = self.env.get_observations()
-                    next_amp_obs = extras["observations"]["amp"]
-                    obs = self.obs_normalizer(obs)
-                    if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(
-                            infos["observations"]["critic"]
+                    step_outcome = self.env.step(actions)
+                    if len(step_outcome) == 5:
+                        obs, critic_source, rewards, dones, infos = step_outcome
+                    elif len(step_outcome) == 4:
+                        obs, rewards, dones, infos = step_outcome
+                        critic_source = None
+                    else:
+                        raise RuntimeError(
+                            "Environment.step must return 4 or 5 values (obs[, critic_obs], reward, done, info)"
                         )
+
+                    next_amp_obs = infos.get("observations", {}).get("amp")
+                    if next_amp_obs is None:
+                        raise KeyError(
+                            "Environment info must contain AMP observations under infos['observations']['amp']"
+                        )
+
+                    obs = self.obs_normalizer(obs)
+                    if critic_source is None:
+                        critic_source = infos.get("observations", {}).get("critic")
+                    if critic_source is not None:
+                        critic_obs = self.critic_obs_normalizer(critic_source)
                     else:
                         critic_obs = obs
                     obs, critic_obs, rewards, dones = (
