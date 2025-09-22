@@ -1,7 +1,7 @@
 """AMP-enabled environment for the Unitree G1 humanoid."""
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
@@ -60,27 +60,16 @@ class G1AMPRobot(G1Robot):
         self._amp_obs_buf[:, 1:] = self._amp_obs_buf[:, :-1]
         self._amp_obs_buf[:, 0] = curr_obs
 
-        amp_flat = self._amp_obs_buf.view(self.num_envs, -1)
-        obs_extras = self.extras.setdefault("observations", {})
-        obs_extras["amp"] = amp_flat
-        if self.privileged_obs_buf is not None:
-            obs_extras["critic"] = self.privileged_obs_buf
+        self._refresh_observation_extras()
 
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
         if self._amp_obs_buf is not None and len(env_ids) > 0:
             self._amp_obs_buf[env_ids] = 0.0
 
-    def get_observations(self) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        amp_flat = (
-            self._amp_obs_buf.view(self.num_envs, -1)
-            if self._amp_obs_buf is not None
-            else torch.zeros(self.num_envs, 0, device=self.device)
-        )
-        extras: Dict[str, torch.Tensor] = {"observations": {"amp": amp_flat}}
-        if self.privileged_obs_buf is not None:
-            extras["observations"]["critic"] = self.privileged_obs_buf
-        return self.obs_buf, extras
+    def get_observations(self) -> torch.Tensor:
+        self._refresh_observation_extras()
+        return self.obs_buf
 
     # ------------------------------------------------------------------
     # AMP utilities
@@ -204,7 +193,34 @@ class G1AMPRobot(G1Robot):
         if self._motion_key_body_indices is None:
             raise RuntimeError("Motion key body indices are undefined; check motion library initialisation.")
 
-        key_body_pos = state["rg_pos"][:, self._motion_key_body_indices, :]
+        key_body_pos = state.get("key_pos")
+        if key_body_pos is not None:
+            # Some motion libraries provide dedicated key positions that may
+            # already match the configured body order. If they instead expose
+            # the full rigid-body array, align them with the configured AMP
+            # indices for backwards compatibility.
+            if key_body_pos.shape[1] != len(self.cfg.amp.key_body_names):
+                if self._motion_key_body_indices is None:
+                    raise RuntimeError(
+                        "Motion key body indices are undefined; cannot align key_pos entries."
+                    )
+                if (
+                    key_body_pos.shape[1]
+                    <= int(self._motion_key_body_indices.max().item())
+                ):
+                    raise ValueError(
+                        "Motion key_pos does not cover the configured AMP key bodies."
+                    )
+                key_body_pos = key_body_pos[:, self._motion_key_body_indices, :]
+        if key_body_pos is not None:
+            key_body_pos = torch.as_tensor(key_body_pos, device=self.device)
+        else:
+            if self._motion_key_body_indices is None:
+                raise RuntimeError(
+                    "Motion key body indices are undefined; check motion library initialisation."
+                )
+            key_body_pos = state["rg_pos"][:, self._motion_key_body_indices, :]
+        key_body_pos = key_body_pos.to(self.device)
         obs = build_amp_observations(
             state["root_pos"],
             state["root_rot"],
@@ -254,3 +270,16 @@ class G1AMPRobot(G1Robot):
                 raise KeyError(f"Body '{name}' not found in simulation asset")
             sim_indices.append(body_dict[name])
         self._amp_key_body_indices = torch.as_tensor(sim_indices, dtype=torch.long, device=self.device)
+
+    def _refresh_observation_extras(self) -> None:
+        """Ensure the latest AMP and critic observations are exposed via extras."""
+
+        amp_flat = (
+            self._amp_obs_buf.view(self.num_envs, -1)
+            if self._amp_obs_buf is not None
+            else torch.zeros(self.num_envs, 0, device=self.device)
+        )
+        obs_extras = self.extras.setdefault("observations", {})
+        obs_extras["amp"] = amp_flat
+        if self.privileged_obs_buf is not None:
+            obs_extras["critic"] = self.privileged_obs_buf

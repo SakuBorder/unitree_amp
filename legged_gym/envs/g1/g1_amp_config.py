@@ -2,6 +2,7 @@
 
 from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs.g1.g1_config import G1RoughCfg, G1RoughCfgPPO
+from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg,LeggedRobotCfgPPO
 
 
 class G1AMPCfg(G1RoughCfg):
@@ -74,6 +75,28 @@ class G1AMPCfg(G1RoughCfg):
         # height correction is required.
         fix_height_mode = "no_fix"
 
+    class rewards( LeggedRobotCfg.rewards ):
+        soft_dof_pos_limit = 0.9
+        base_height_target = 0.78
+        
+        class scales( LeggedRobotCfg.rewards.scales ):
+            tracking_lin_vel = 1.0
+            tracking_ang_vel = 0.5
+            lin_vel_z = -2.0
+            ang_vel_xy = -0.05
+            orientation = -1.0
+            base_height = -10.0
+            dof_acc = -2.5e-7
+            dof_vel = -1e-3
+            feet_air_time = 0.0
+            collision = 0.0
+            action_rate = -0.01
+            dof_pos_limits = -5.0
+            alive = 0.15
+            hip_pos = -1.0
+            contact_no_vel = -0.2
+            feet_swing_height = -0.0
+            contact = 0.0
 
 class G1AMPCfgPPO(G1RoughCfgPPO):
     """Training configuration for AMP + PPO on the G1 task."""
