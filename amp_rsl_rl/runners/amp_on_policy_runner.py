@@ -10,6 +10,7 @@ import os
 import statistics
 import time
 from collections import deque
+from copy import deepcopy
 
 import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
@@ -62,10 +63,16 @@ class AMPOnPolicyRunner:
     """
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
-        self.cfg = train_cfg
-        self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
-        self.discriminator_cfg = train_cfg["discriminator"]
+        # ``train_cfg`` follows the same structure expected by the base
+        # ``OnPolicyRunner``.  The runner-specific parameters live under the
+        # ``runner`` key, while policy/algorithm settings are grouped in their
+        # respective sections.  Fall back gracefully if an older flat layout is
+        # provided.
+        self.train_cfg = train_cfg
+        self.cfg = train_cfg.get("runner", train_cfg)
+        self.alg_cfg = deepcopy(train_cfg.get("algorithm", {}))
+        self.policy_cfg = deepcopy(train_cfg.get("policy", {}))
+        self.discriminator_cfg = deepcopy(train_cfg.get("discriminator", {}))
         self.task_reward_weight = train_cfg.get("task_reward_weight", 0.5)
         self.style_reward_weight = train_cfg.get("style_reward_weight", 0.5)
         self.device = device
@@ -78,7 +85,11 @@ class AMPOnPolicyRunner:
             num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
             num_critic_obs = num_obs
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
+        policy_class_name = self.cfg.get(
+            "policy_class_name", self.policy_cfg.get("class_name", "ActorCritic")
+        )
+        self.policy_cfg.pop("class_name", None)
+        actor_critic_class = eval(policy_class_name)  # ActorCritic
         actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
             actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
@@ -139,7 +150,11 @@ class AMPOnPolicyRunner:
         ).to(self.device)
 
         # Initialize the PPO algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))  # AMP_PPO
+        algorithm_class_name = self.cfg.get(
+            "algorithm_class_name", self.alg_cfg.get("class_name", "AMP_PPO")
+        )
+        self.alg_cfg.pop("class_name", None)
+        alg_class = eval(algorithm_class_name)  # AMP_PPO
         
         # Extract normalize_amp_input before processing alg_cfg to avoid conflicts
         normalize_amp_input = self.alg_cfg.pop("normalize_amp_input", True)
@@ -168,9 +183,21 @@ class AMPOnPolicyRunner:
             **self.alg_cfg,
         )
         
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.save_interval = self.cfg["save_interval"]
-        self.empirical_normalization = self.cfg["empirical_normalization"]
+        self.num_steps_per_env = self.cfg.get(
+            "num_steps_per_env", train_cfg.get("num_steps_per_env")
+        )
+        self.save_interval = self.cfg.get(
+            "save_interval", train_cfg.get("save_interval", 0)
+        )
+        self.empirical_normalization = train_cfg.get("empirical_normalization", False)
+        if self.num_steps_per_env is None:
+            raise KeyError(
+                "num_steps_per_env must be defined in the runner or top-level train config"
+            )
+        if self.save_interval is None:
+            raise KeyError(
+                "save_interval must be defined in the runner or top-level train config"
+            )
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(
                 shape=[num_obs], until=1.0e8
@@ -197,22 +224,28 @@ class AMPOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        # Ensure environments are initialised consistently with the base
+        # runner implementation.
+        if hasattr(self.env, "reset"):
+            self.env.reset()
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
-            self.logger_type = self.cfg.get("logger", "tensorboard")
+            self.logger_type = self.cfg.get(
+                "logger", self.train_cfg.get("logger", "tensorboard")
+            )
             self.logger_type = self.logger_type.lower()
 
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 
                 self.writer = NeptuneSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
+                    log_dir=self.log_dir, flush_secs=10, cfg=self.train_cfg
                 )
                 self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
+                    self.env.cfg, self.train_cfg, self.alg_cfg, self.policy_cfg
                 )
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
@@ -253,13 +286,20 @@ class AMPOnPolicyRunner:
                     print("Updated run name to:", wandb.run.name)
 
                 self.writer = WandbSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
+                    log_dir=self.log_dir, flush_secs=10, cfg=self.train_cfg
                 )
-                update_run_name_with_sequence(prefix=self.cfg["wandb_project"])
+                prefix = self.cfg.get(
+                    "wandb_project", self.train_cfg.get("wandb_project")
+                )
+                if prefix is None:
+                    raise KeyError(
+                        "wandb_project must be specified in the runner or training config when using the wandb logger"
+                    )
+                update_run_name_with_sequence(prefix=prefix)
 
                 wandb.gym.monitor()
                 self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
+                    self.env.cfg, self.train_cfg, self.alg_cfg, self.policy_cfg
                 )
             elif self.logger_type == "tensorboard":
                 self.writer = TensorboardSummaryWriter(
@@ -392,10 +432,9 @@ class AMPOnPolicyRunner:
             ) = self.alg.update()
             stop = time.time()
             learn_time = stop - start
-            self.current_learning_iteration = it
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
+            if self.save_interval and it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
             ep_infos.clear()
             if it == start_iter:
@@ -406,6 +445,7 @@ class AMPOnPolicyRunner:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
+        self.current_learning_iteration = tot_iter
         self.save(
             os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
             save_onnx=True,
@@ -658,7 +698,7 @@ class AMPOnPolicyRunner:
         if device is not None:
             self.alg.actor_critic.to(device)
         policy = self.alg.actor_critic.act_inference
-        if self.cfg["empirical_normalization"]:
+        if self.empirical_normalization:
             if device is not None:
                 self.obs_normalizer.to(device)
             policy = lambda x: self.alg.actor_critic.act_inference(
