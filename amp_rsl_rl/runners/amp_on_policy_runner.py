@@ -10,8 +10,10 @@ import os
 import statistics
 import time
 from collections import deque
+from copy import deepcopy
 
 import torch
+from torch.onnx import errors as onnx_errors
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
@@ -62,23 +64,32 @@ class AMPOnPolicyRunner:
     """
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
-        self.cfg = train_cfg
-        self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
-        self.discriminator_cfg = train_cfg["discriminator"]
+        # ``train_cfg`` follows the same structure expected by the base
+        # ``OnPolicyRunner``.  The runner-specific parameters live under the
+        # ``runner`` key, while policy/algorithm settings are grouped in their
+        # respective sections.  Fall back gracefully if an older flat layout is
+        # provided.
+        self.train_cfg = train_cfg
+        self.cfg = train_cfg.get("runner", train_cfg)
+        self.alg_cfg = deepcopy(train_cfg.get("algorithm", {}))
+        self.policy_cfg = deepcopy(train_cfg.get("policy", {}))
+        self.discriminator_cfg = deepcopy(train_cfg.get("discriminator", {}))
         self.task_reward_weight = train_cfg.get("task_reward_weight", 0.5)
         self.style_reward_weight = train_cfg.get("style_reward_weight", 0.5)
         self.device = device
         self.env = env
 
         # Get the size of the observation space
-        obs, extras = self.env.get_observations()
+        obs = self.env.get_observations()
+        obs_extras = self._require_observation_extras()
         num_obs = obs.shape[1]
-        if "critic" in extras["observations"]:
-            num_critic_obs = extras["observations"]["critic"].shape[1]
-        else:
-            num_critic_obs = num_obs
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
+        critic_tensor = obs_extras.get("critic")
+        num_critic_obs = critic_tensor.shape[1] if critic_tensor is not None else num_obs
+        policy_class_name = self.cfg.get(
+            "policy_class_name", self.policy_cfg.get("class_name", "ActorCritic")
+        )
+        self.policy_cfg.pop("class_name", None)
+        actor_critic_class = eval(policy_class_name)  # ActorCritic
         actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
             actor_critic_class(
                 num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
@@ -106,11 +117,11 @@ class AMPOnPolicyRunner:
         # lazily populated only after the first physics step.  If the buffer is
         # still empty here, trigger a dummy post-physics step to populate it so
         # the normalizer is created with the correct dimensionality.
-        num_amp_obs = extras["observations"]["amp"].shape[1]
+        num_amp_obs = obs_extras["amp"].shape[1]
         if num_amp_obs == 0:
             self.env.post_physics_step()
-            _, extras = self.env.get_observations()
-            num_amp_obs = extras["observations"]["amp"].shape[1]
+            obs_extras = self._require_observation_extras()
+            num_amp_obs = obs_extras["amp"].shape[1]
 
         if not hasattr(self.env, "fetch_amp_obs_demo") or getattr(self.env, "_motion_lib", None) is None:
             raise RuntimeError("Environment must provide MotionLib demos via fetch_amp_obs_demo")
@@ -139,7 +150,11 @@ class AMPOnPolicyRunner:
         ).to(self.device)
 
         # Initialize the PPO algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))  # AMP_PPO
+        algorithm_class_name = self.cfg.get(
+            "algorithm_class_name", self.alg_cfg.get("class_name", "AMP_PPO")
+        )
+        self.alg_cfg.pop("class_name", None)
+        alg_class = eval(algorithm_class_name)  # AMP_PPO
         
         # Extract normalize_amp_input before processing alg_cfg to avoid conflicts
         normalize_amp_input = self.alg_cfg.pop("normalize_amp_input", True)
@@ -168,9 +183,21 @@ class AMPOnPolicyRunner:
             **self.alg_cfg,
         )
         
-        self.num_steps_per_env = self.cfg["num_steps_per_env"]
-        self.save_interval = self.cfg["save_interval"]
-        self.empirical_normalization = self.cfg["empirical_normalization"]
+        self.num_steps_per_env = self.cfg.get(
+            "num_steps_per_env", train_cfg.get("num_steps_per_env")
+        )
+        self.save_interval = self.cfg.get(
+            "save_interval", train_cfg.get("save_interval", 0)
+        )
+        self.empirical_normalization = train_cfg.get("empirical_normalization", False)
+        if self.num_steps_per_env is None:
+            raise KeyError(
+                "num_steps_per_env must be defined in the runner or top-level train config"
+            )
+        if self.save_interval is None:
+            raise KeyError(
+                "save_interval must be defined in the runner or top-level train config"
+            )
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(
                 shape=[num_obs], until=1.0e8
@@ -193,26 +220,39 @@ class AMPOnPolicyRunner:
         # Log
         self.log_dir = log_dir
         self.writer = None
+        self.logger_type = None
         self.tot_timesteps = 0
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+        self.export_policy_as_onnx = bool(
+            self.cfg.get(
+                "export_policy_as_onnx",
+                train_cfg.get("export_policy_as_onnx", False),
+            )
+        )
+        # Ensure environments are initialised consistently with the base
+        # runner implementation.
+        if hasattr(self.env, "reset"):
+            self.env.reset()
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
-            self.logger_type = self.cfg.get("logger", "tensorboard")
+            self.logger_type = self.cfg.get(
+                "logger", self.train_cfg.get("logger", "tensorboard")
+            )
             self.logger_type = self.logger_type.lower()
 
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 
                 self.writer = NeptuneSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
+                    log_dir=self.log_dir, flush_secs=10, cfg=self.train_cfg
                 )
                 self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
+                    self.env.cfg, self.train_cfg, self.alg_cfg, self.policy_cfg
                 )
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
@@ -253,13 +293,20 @@ class AMPOnPolicyRunner:
                     print("Updated run name to:", wandb.run.name)
 
                 self.writer = WandbSummaryWriter(
-                    log_dir=self.log_dir, flush_secs=10, cfg=self.cfg
+                    log_dir=self.log_dir, flush_secs=10, cfg=self.train_cfg
                 )
-                update_run_name_with_sequence(prefix=self.cfg["wandb_project"])
+                prefix = self.cfg.get(
+                    "wandb_project", self.train_cfg.get("wandb_project")
+                )
+                if prefix is None:
+                    raise KeyError(
+                        "wandb_project must be specified in the runner or training config when using the wandb logger"
+                    )
+                update_run_name_with_sequence(prefix=prefix)
 
                 wandb.gym.monitor()
                 self.writer.log_config(
-                    self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
+                    self.env.cfg, self.train_cfg, self.alg_cfg, self.policy_cfg
                 )
             elif self.logger_type == "tensorboard":
                 self.writer = TensorboardSummaryWriter(
@@ -272,9 +319,10 @@ class AMPOnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs, extras = self.env.get_observations()
-        amp_obs = extras["observations"]["amp"]
-        critic_obs = extras["observations"].get("critic", obs)
+        obs = self.env.get_observations()
+        obs_extras = self._require_observation_extras()
+        amp_obs = obs_extras["amp"]
+        critic_obs = obs_extras.get("critic", obs)
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
         amp_obs = amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -295,21 +343,37 @@ class AMPOnPolicyRunner:
             start = time.time()
             # Rollout
 
-            mean_style_reward_log = 0
-            mean_task_reward_log = 0
+            mean_style_reward_log = 0.0
+            mean_task_reward_log = 0.0
+            mean_style_reward_weighted_log = 0.0
+            mean_task_reward_weighted_log = 0.0
 
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
                     self.alg.act_amp(amp_obs)
-                    obs, rewards, dones, infos = self.env.step(actions)
-                    _, extras = self.env.get_observations()
-                    next_amp_obs = extras["observations"]["amp"]
-                    obs = self.obs_normalizer(obs)
-                    if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(
-                            infos["observations"]["critic"]
+                    step_outcome = self.env.step(actions)
+                    if len(step_outcome) == 5:
+                        obs, critic_source, rewards, dones, infos = step_outcome
+                    elif len(step_outcome) == 4:
+                        obs, rewards, dones, infos = step_outcome
+                        critic_source = None
+                    else:
+                        raise RuntimeError(
+                            "Environment.step must return 4 or 5 values (obs[, critic_obs], reward, done, info)"
                         )
+
+                    next_amp_obs = infos.get("observations", {}).get("amp")
+                    if next_amp_obs is None:
+                        raise KeyError(
+                            "Environment info must contain AMP observations under infos['observations']['amp']"
+                        )
+
+                    obs = self.obs_normalizer(obs)
+                    if critic_source is None:
+                        critic_source = infos.get("observations", {}).get("critic")
+                    if critic_source is not None:
+                        critic_obs = self.critic_obs_normalizer(critic_source)
                     else:
                         critic_obs = obs
                     obs, critic_obs, rewards, dones = (
@@ -325,13 +389,17 @@ class AMPOnPolicyRunner:
                         amp_obs, next_amp_obs, normalizer=self.amp_normalizer
                     )
 
-                    # Track weighted contributions for logging
-                    mean_task_reward_log += (
-                        self.task_reward_weight * rewards.mean().item()
+                    task_reward_mean = rewards.mean().item()
+                    style_reward_mean = style_rewards.mean().item()
+                    mean_task_reward_log += task_reward_mean
+                    mean_style_reward_log += style_reward_mean
+
+                    weighted_task_mean = self.task_reward_weight * task_reward_mean
+                    weighted_style_mean = (
+                        self.style_reward_weight * style_reward_mean
                     )
-                    mean_style_reward_log += (
-                        self.style_reward_weight * style_rewards.mean().item()
-                    )
+                    mean_task_reward_weighted_log += weighted_task_mean
+                    mean_style_reward_weighted_log += weighted_style_mean
 
                     # Combine the task and style rewards only if style rewards are enabled
                     if self.discriminator.reward_scale != 0:
@@ -375,7 +443,11 @@ class AMPOnPolicyRunner:
 
             mean_style_reward_log /= self.num_steps_per_env
             mean_task_reward_log /= self.num_steps_per_env
-            mean_total_reward_log = mean_style_reward_log + mean_task_reward_log
+            mean_style_reward_weighted_log /= self.num_steps_per_env
+            mean_task_reward_weighted_log /= self.num_steps_per_env
+            mean_total_reward_log = (
+                mean_style_reward_weighted_log + mean_task_reward_weighted_log
+            )
 
             (
                 mean_value_loss,
@@ -392,11 +464,13 @@ class AMPOnPolicyRunner:
             ) = self.alg.update()
             stop = time.time()
             learn_time = stop - start
-            self.current_learning_iteration = it
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
+            if self.save_interval and it % self.save_interval == 0:
+                self.save(
+                    os.path.join(self.log_dir, f"model_{it}.pt"),
+                    save_onnx=self.export_policy_as_onnx,
+                )
             ep_infos.clear()
             if it == start_iter:
                 # obtain all the diff files
@@ -406,10 +480,32 @@ class AMPOnPolicyRunner:
                     for path in git_file_paths:
                         self.writer.save_file(path)
 
+        self.current_learning_iteration = tot_iter
         self.save(
             os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
-            save_onnx=True,
+            save_onnx=self.export_policy_as_onnx,
         )
+
+    def _require_observation_extras(self, extras: dict | None = None) -> dict:
+        """Retrieve the observation extras dictionary with AMP features."""
+
+        if extras is None:
+            extras = getattr(self.env, "extras", None)
+        if not isinstance(extras, dict):
+            raise KeyError("Environment must expose extras dictionary with AMP observations")
+
+        obs_extras = extras.get("observations")
+        if not isinstance(obs_extras, dict):
+            raise KeyError(
+                "Environment extras must contain an 'observations' dictionary for AMP runner"
+            )
+
+        if "amp" not in obs_extras:
+            raise KeyError(
+                "Environment observations must include AMP features under extras['observations']['amp']"
+            )
+
+        return obs_extras
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
@@ -499,6 +595,16 @@ class AMPOnPolicyRunner:
                 "Train/mean_task_reward", locs["mean_task_reward_log"], locs["it"]
             )
             self.writer.add_scalar(
+                "Train/mean_style_reward_weighted",
+                locs["mean_style_reward_weighted_log"],
+                locs["it"],
+            )
+            self.writer.add_scalar(
+                "Train/mean_task_reward_weighted",
+                locs["mean_task_reward_weighted_log"],
+                locs["it"],
+            )
+            self.writer.add_scalar(
                 "Train/mean_total_reward", locs["mean_total_reward_log"], locs["it"]
             )
             if (
@@ -533,8 +639,10 @@ class AMPOnPolicyRunner:
                 f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
-                f"""{'Mean task reward:':>{pad}} {locs['mean_task_reward_log']:.2f}\n"""
-                f"""{'Mean style reward:':>{pad}} {locs['mean_style_reward_log']:.2f}\n"""
+                f"""{'Mean task reward (raw):':>{pad}} {locs['mean_task_reward_log']:.2f}\n"""
+                f"""{'Mean task reward (weighted):':>{pad}} {locs['mean_task_reward_weighted_log']:.2f}\n"""
+                f"""{'Mean style reward (raw):':>{pad}} {locs['mean_style_reward_log']:.2f}\n"""
+                f"""{'Mean style reward (weighted):':>{pad}} {locs['mean_style_reward_weighted_log']:.2f}\n"""
                 f"""{'Mean total reward:':>{pad}} {locs['mean_total_reward_log']:.2f}\n"""
             )
             #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
@@ -609,12 +717,24 @@ class AMPOnPolicyRunner:
             iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
             onnx_model_name = f"policy_{iteration}.onnx"
 
-            export_policy_as_onnx(
-                self.alg.actor_critic,
-                normalizer=self.obs_normalizer,
-                path=onnx_folder,
-                filename=onnx_model_name,
-            )
+            try:
+                export_policy_as_onnx(
+                    self.alg.actor_critic,
+                    normalizer=self.obs_normalizer,
+                    path=onnx_folder,
+                    filename=onnx_model_name,
+                )
+            except ModuleNotFoundError as exc:
+                print(
+                    f"Warning: skipping ONNX export because a dependency is missing: {exc}"
+                )
+            except onnx_errors.OnnxExporterError as exc:
+                if "Module onnx is not installed" in str(exc):
+                    print(
+                        "Warning: skipping ONNX export because the onnx package is not installed"
+                    )
+                else:
+                    raise
 
             if self.logger_type in ["neptune", "wandb"]:
                 self.writer.save_model(
@@ -658,7 +778,7 @@ class AMPOnPolicyRunner:
         if device is not None:
             self.alg.actor_critic.to(device)
         policy = self.alg.actor_critic.act_inference
-        if self.cfg["empirical_normalization"]:
+        if self.empirical_normalization:
             if device is not None:
                 self.obs_normalizer.to(device)
             policy = lambda x: self.alg.actor_critic.act_inference(
