@@ -30,7 +30,7 @@ import numpy as np
 
 import torch
 from torch import nn
-import smpl_sim.utils.pytorch3d_transforms as ptr
+import phc.smpl_sim.utils.pytorch3d_transforms as ptr
 import torch.nn.functional as F
 
 

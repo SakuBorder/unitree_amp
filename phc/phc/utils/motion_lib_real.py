@@ -5,23 +5,23 @@ import yaml
 from tqdm import tqdm
 import os.path as osp
 
-from phc.utils import torch_utils
+from phc.phc.utils import torch_utils
 import joblib
 import torch
 import torch.multiprocessing as mp
 # import multiprocessing as mp
 import copy
 import gc
-from smpl_sim.smpllib.smpl_parser import (
+from phc.smpl_sim.smpllib.smpl_parser import (
     SMPL_Parser,
     SMPLH_Parser,
     SMPLX_Parser,
 )
 from scipy.spatial.transform import Rotation as sRot
 import random
-from phc.utils.flags import flags
-from phc.utils.motion_lib_base import MotionLibBase, DeviceCache, compute_motion_dof_vels, FixHeightMode
-from phc.utils.torch_humanoid_batch import Humanoid_Batch
+from phc.phc.utils.flags import flags
+from phc.phc.utils.motion_lib_base import MotionLibBase, DeviceCache, compute_motion_dof_vels, FixHeightMode
+from phc.phc.utils.torch_humanoid_batch import Humanoid_Batch
 from easydict import EasyDict
 import logging
 

@@ -37,21 +37,21 @@ from isaacgym import gymtorch
 from isaacgym import gymapi
 from isaacgym.torch_utils import *
 import joblib
-from phc.utils import torch_utils
+from phc.phc.utils import torch_utils
 
-from smpl_sim.smpllib.smpl_joint_names import SMPL_MUJOCO_NAMES, SMPLH_MUJOCO_NAMES
-from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
+from phc.smpl_sim.smpllib.smpl_joint_names import SMPL_MUJOCO_NAMES, SMPLH_MUJOCO_NAMES
+from phc.smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
 
-from phc.utils.flags import flags
-from phc.env.tasks.base_task import BaseTask
+from phc.phc.utils.flags import flags
+from phc.phc.env.tasks.base_task import BaseTask
 from tqdm import tqdm
-from poselib.poselib.skeleton.skeleton3d import SkeletonTree
+from phc.scripts.lpanlib.poselib.skeleton.skeleton3d import SkeletonTree
 from collections import defaultdict
-from poselib.poselib.skeleton.skeleton3d import SkeletonMotion, SkeletonState
+from phc.scripts.lpanlib.poselib.skeleton.skeleton3d import SkeletonMotion, SkeletonState
 from scipy.spatial.transform import Rotation as sRot
 import gc
 import torch.multiprocessing as mp
-from phc.utils.draw_utils import agt_color, get_color_gradient
+from phc.phc.utils.draw_utils import agt_color, get_color_gradient
 
 
 ENABLE_MAX_COORD_OBS = True

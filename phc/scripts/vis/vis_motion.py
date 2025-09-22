@@ -23,7 +23,7 @@ from isaacgym import gymapi, gymutil, gymtorch
 import torch
 from phc.utils.motion_lib_g1 import MotionLibG1 as MotionLibG1
 from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
-from poselib.poselib.skeleton.skeleton3d import SkeletonTree
+from poselib.skeleton.skeleton3d import SkeletonTree
 from phc.utils.flags import flags
 
 flags.test = True

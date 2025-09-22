@@ -1,4 +1,4 @@
-from phc.utils import logger
+from phc.phc.utils import logger
 from isaacgym import gymapi
 import numpy as np
 import torch

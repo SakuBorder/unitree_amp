@@ -9,7 +9,7 @@ from smplx import SMPLH as _SMPLH
 from smplx import SMPLX as _SMPLX
 
 from smplx import MANO as _MANO
-from smpl_sim.smpllib.smpl_joint_names import *
+from phc.smpl_sim.smpllib.smpl_joint_names import *
 
 SMPL_EE_NAMES = ["L_Ankle", "R_Ankle", "L_Wrist", "R_Wrist", "Head"]
  

@@ -2,9 +2,9 @@ from typing import Any, Sequence
 import numpy as np
 from collections import OrderedDict
 
-from smpl_sim.envs.humanoid_task import HumanoidTask
-import smpl_sim.utils.np_transform_utils as npt_utils
-from smpl_sim.utils.mujoco_utils import add_visual_capsule
+from phc.smpl_sim.envs.humanoid_task import HumanoidTask
+import phc.smpl_sim.utils.np_transform_utils as npt_utils
+from phc.smpl_sim.utils.mujoco_utils import add_visual_capsule
 
 def forward_reward(tar_speed, root_pos, prev_root_pos, dt):
 

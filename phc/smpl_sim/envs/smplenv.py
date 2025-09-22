@@ -6,10 +6,10 @@ from pathlib import Path
 from absl import logging
 
 # SMPL imports
-from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
-from smpl_sim.smpllib import smpl_mujoco_new as smplmj
-from smpl_sim.smpllib import smpl_xml_addons as smplxadd
-from smpl_sim.envs import controllers as ctrlm
+from phc.smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
+from phc.smpl_sim.smpllib import smpl_mujoco_new as smplmj
+from phc.smpl_sim.smpllib import smpl_xml_addons as smplxadd
+from phc.smpl_sim.envs import controllers as ctrlm
 import warnings
 from collections import OrderedDict
 

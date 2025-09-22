@@ -1,5 +1,5 @@
 import numpy as np
-from smpl_sim.envs.humanoid_env import HumanoidEnv
+from phc.smpl_sim.envs.humanoid_env import HumanoidEnv
 
 class HumanoidTask(HumanoidEnv):
         

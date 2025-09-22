@@ -14,13 +14,13 @@ from enum import Enum
 from collections import defaultdict
 import torch
 
-from smpl_sim.envs.base_env import BaseEnv
-import smpl_sim.envs.controllers as ctrls
-from smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
-from smpl_sim.smpllib import smpl_xml_addons as smplxadd
-from smpl_sim.smpllib.motion_lib_base import FixHeightMode
-import smpl_sim.utils.np_transform_utils as npt_utils
-import smpl_sim.utils.mujoco_utils as mj_utils
+from phc.smpl_sim.envs.base_env import BaseEnv
+import phc.smpl_sim.envs.controllers as ctrls
+from phc.smpl_sim.smpllib.smpl_local_robot import SMPL_Robot
+from phc.smpl_sim.smpllib import smpl_xml_addons as smplxadd
+from phc.smpl_sim.smpllib.motion_lib_base import FixHeightMode
+import phc.smpl_sim.utils.np_transform_utils as npt_utils
+import phc.smpl_sim.utils.mujoco_utils as mj_utils
 
 try:
     # Python < 3.9

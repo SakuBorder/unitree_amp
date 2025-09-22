@@ -10,13 +10,13 @@ import os
 import yaml
 from tqdm import tqdm
 
-from smpl_sim.utils import torch_utils
+from phc.smpl_sim.utils import torch_utils
 import joblib
 import torch
 import torch.multiprocessing as mp
 import copy
 import gc
-from smpl_sim.smpllib.smpl_parser import (
+from phc.smpl_sim.smpllib.smpl_parser import (
     SMPL_Parser,
     SMPLH_Parser,
     SMPLX_Parser,

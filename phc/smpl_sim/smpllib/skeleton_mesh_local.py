@@ -3,7 +3,7 @@ from lxml.etree import XMLParser, parse, ElementTree, Element, SubElement
 from lxml import etree
 import math
 import numpy as np
-from smpl_sim.utils.transformation import quaternion_from_matrix
+from phc.smpl_sim.utils.transformation import quaternion_from_matrix
 from scipy.spatial.transform import Rotation as sRot
 try:
     # Python < 3.9
@@ -269,7 +269,7 @@ class Skeleton:
 
     def write_str(
             self,
-            template_fname=files('smpl_sim').joinpath('data/assets/mjcf/humanoid_template_local.xml'),
+            template_fname=files('phc.smpl_sim').joinpath('data/assets/mjcf/humanoid_template_local.xml'),
             offset=np.array([0, 0, 0]),
             ref_angles=None,
             bump_buffer=False,
@@ -284,7 +284,7 @@ class Skeleton:
     def write_xml(
             self,
             fname,
-            template_fname=files('smpl_sim').joinpath('data/assets/mjcf/humanoid_template_local.xml'),
+            template_fname=files('phc.smpl_sim').joinpath('data/assets/mjcf/humanoid_template_local.xml'),
             offset=np.array([0, 0, 0]),
             ref_angles=None,
             bump_buffer=False,
@@ -307,7 +307,7 @@ class Skeleton:
 
     def construct_tree(
             self,
-            template_fname=files('smpl_sim').joinpath('data/assets/mjcf/humanoid_template_local.xml'),
+            template_fname=files('phc.smpl_sim').joinpath('data/assets/mjcf/humanoid_template_local.xml'),
             offset=np.array([0, 0, 0]),
             ref_angles=None,
     ):

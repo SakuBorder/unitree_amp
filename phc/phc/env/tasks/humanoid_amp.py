@@ -43,23 +43,23 @@ from typing import Dict, Optional
 from isaacgym import gymapi
 from isaacgym import gymtorch
 
-from phc.env.tasks.humanoid import Humanoid, dof_to_obs, remove_base_rot, dof_to_obs_smpl
-from phc.env.util import gym_util
-from phc.utils.motion_lib_real import MotionLibReal
-from phc.utils.motion_lib_smpl import MotionLibSMPL 
-from phc.utils.motion_lib_base import FixHeightMode
+from phc.phc.env.tasks.humanoid import Humanoid, dof_to_obs, remove_base_rot, dof_to_obs_smpl
+from phc.phc.env.util import gym_util
+from phc.phc.utils.motion_lib_real import MotionLibReal
+from phc.phc.utils.motion_lib_smpl import MotionLibSMPL 
+from phc.phc.utils.motion_lib_base import FixHeightMode
 from easydict import EasyDict
 
 from isaacgym.torch_utils import *
-from phc.utils import torch_utils
+from phc.phc.utils import torch_utils
 
-from smpl_sim.smpllib.smpl_parser import (
+from phc.smpl_sim.smpllib.smpl_parser import (
     SMPL_Parser,
     SMPLH_Parser,
     SMPLX_Parser,
 )
 import gc
-from phc.utils.flags import flags
+from phc.phc.utils.flags import flags
 from collections import OrderedDict
 
 HACK_MOTION_SYNC = False
@@ -826,8 +826,8 @@ class HumanoidAMP(Humanoid):
 
     def _hack_output_motion(self):
         fps = 1.0 / self.dt
-        from poselib.poselib.skeleton.skeleton3d import SkeletonMotion, SkeletonState
-        from poselib.poselib.visualization.common import plot_skeleton_motion_interactive
+        from poselib.skeleton.skeleton3d import SkeletonMotion, SkeletonState
+        from poselib.visualization.common import plot_skeleton_motion_interactive
 
         if (not hasattr(self, '_output_motion_root_pos')):
             self._output_motion_root_pos = []

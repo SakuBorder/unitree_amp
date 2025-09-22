@@ -29,6 +29,45 @@
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
 import torch
+import subprocess
+import os
+import torch.nn as nn
+
+
+def resolve_nn_activation(name: str):
+    """Return a PyTorch activation module for ``name``.
+
+    Args:
+        name (str): Name of the activation function (case insensitive).
+
+    Returns:
+        torch.nn.Module: Instantiated activation module.
+
+    Raises:
+        ValueError: If ``name`` does not correspond to a known activation.
+    """
+    name = (name or "identity").lower()
+    if name in ("elu",):
+        return nn.ELU()
+    if name in ("relu",):
+        return nn.ReLU()
+    if name in ("selu",):
+        return nn.SELU()
+    if name in ("tanh",):
+        return nn.Tanh()
+    if name in ("sigmoid",):
+        return nn.Sigmoid()
+    if name in ("leaky_relu", "leakyrelu"):
+        return nn.LeakyReLU()
+    if name in ("silu", "swish"):
+        return nn.SiLU()
+    if name in ("gelu",):
+        return nn.GELU()
+    if name in ("softplus",):
+        return nn.Softplus()
+    if name in ("identity", "linear", "none"):
+        return nn.Identity()
+    raise ValueError(f"Unknown activation '{name}'")
 
 def split_and_pad_trajectories(tensor, dones):
     """ Splits trajectories at done indices. Then concatenates them and padds with zeros up to the length og the longest trajectory.
@@ -69,3 +108,41 @@ def unpad_trajectories(trajectories, masks):
     """
     # Need to transpose before and after the masking to have proper reshaping
     return trajectories.transpose(1, 0)[masks.transpose(1, 0)].view(-1, trajectories.shape[0], trajectories.shape[-1]).transpose(1, 0)
+
+def store_code_state(log_dir, repo_paths):
+    """Save git status and diff for repositories.
+
+    Args:
+        log_dir (str): Directory where logs will be written.
+        repo_paths (Iterable[str]): Iterable of paths to git repositories.
+
+    Returns:
+        list[str]: Paths of the generated status and diff files.
+    """
+
+    saved_files = []
+    for repo in repo_paths:
+        repo_path = os.path.abspath(repo)
+        if not os.path.exists(os.path.join(repo_path, ".git")):
+            continue
+        repo_name = os.path.basename(repo_path.rstrip(os.sep))
+        status_file = os.path.join(log_dir, f"{repo_name}_git_status.txt")
+        diff_file = os.path.join(log_dir, f"{repo_name}_git_diff.patch")
+        try:
+            commit = subprocess.check_output(
+                ["git", "-C", repo_path, "rev-parse", "HEAD"], text=True
+            ).strip()
+            status = subprocess.check_output(
+                ["git", "-C", repo_path, "status", "--short"], text=True
+            )
+            with open(status_file, "w") as f:
+                f.write(f"commit: {commit}\n{status}")
+            diff = subprocess.check_output(
+                ["git", "-C", repo_path, "diff"], text=True
+            )
+            with open(diff_file, "w") as f:
+                f.write(diff)
+            saved_files.extend([status_file, diff_file])
+        except Exception:
+            continue
+    return saved_files

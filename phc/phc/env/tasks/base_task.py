@@ -48,7 +48,7 @@ import torch
 
 import imageio
 from datetime import datetime
-from phc.utils.flags import flags
+from phc.phc.utils.flags import flags
 from collections import defaultdict
 import aiohttp, cv2, asyncio
 import json

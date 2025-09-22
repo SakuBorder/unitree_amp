@@ -16,9 +16,9 @@ from lxml.etree import XMLParser, parse, ElementTree, Element, SubElement
 from lxml import etree
 from io import BytesIO
 import mujoco
-from smpl_sim.smpllib.skeleton_local import Skeleton
-from smpl_sim.smpllib.skeleton_mesh_local import Skeleton as SkeletonMesh
-from smpl_sim.smpllib.smpl_parser import (
+from phc.smpl_sim.smpllib.skeleton_local import Skeleton
+from phc.smpl_sim.smpllib.skeleton_mesh_local import Skeleton as SkeletonMesh
+from phc.smpl_sim.smpllib.smpl_parser import (
     SMPL_Parser,
     SMPLH_Parser,
     SMPLX_Parser,
@@ -27,7 +27,7 @@ from collections import defaultdict
 from scipy.spatial import ConvexHull
 from stl import mesh
 try:
-    from smpl_sim.utils.geom import quadric_mesh_decimation, center_scale_mesh
+    from phc.smpl_sim.utils.geom import quadric_mesh_decimation, center_scale_mesh
 except:
     pass
 import uuid
