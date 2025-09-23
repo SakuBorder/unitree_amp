@@ -30,7 +30,7 @@ class TrajGenerator():
         self._verts_flat = torch.zeros((num_envs * num_verts, 3), dtype=torch.float32, device=self._device)
         self._verts = self._verts_flat.view((num_envs, num_verts, 3))
 
-        env_ids = torch.arange(self.get_num_envs(), dtype=np.int)
+        env_ids = torch.arange(self.get_num_envs(), dtype=torch.long)
 
         # self.traj_data = joblib.load("data/traj/traj_data.pkl")
         self.heading = torch.zeros(num_envs, 1)
