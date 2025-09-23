@@ -2,10 +2,10 @@ import torch
 
 from TokenHSI.tokenhsi.utils import traj_generator
 
-from legged_gym.envs.g1.g1_env import G1Robot
+from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
 
 
-class G1TrajRobot(G1Robot):
+class G1TrajRobot(G1AMPRobot):
     """G1 task with trajectory following observations and rewards."""
 
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
@@ -35,6 +35,7 @@ class G1TrajRobot(G1Robot):
         self.obs_buf = torch.cat((self.obs_buf, traj_obs), dim=-1)
         if self.privileged_obs_buf is not None:
             self.privileged_obs_buf = torch.cat((self.privileged_obs_buf, traj_obs), dim=-1)
+        self._refresh_observation_extras()
         return self.obs_buf
 
     def _compute_traj_obs(self, env_ids=None):
