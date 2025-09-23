@@ -24,6 +24,28 @@ class G1TrajRobot(G1AMPRobot):
 
         self._build_traj_generator()
 
+    # ------------------------------------------------------------------
+    # Noise handling
+    # ------------------------------------------------------------------
+    def _get_noise_scale_vec(self, cfg):
+        """Restrict stochastic observation noise to the proprioceptive slice."""
+
+        base_noise = super()._get_noise_scale_vec(cfg)
+        base_obs_dim = cfg.env.num_observations - 2 * self._num_traj_samples
+
+        if base_obs_dim <= 0:
+            raise ValueError("Trajectory configuration must reserve space for proprioceptive observations.")
+
+        if base_noise.shape[-1] == base_obs_dim:
+            return base_noise
+
+        if base_noise.shape[-1] < base_obs_dim:
+            raise RuntimeError(
+                "Base observation noise vector is smaller than the proprioceptive observation width."
+            )
+
+        return base_noise[..., :base_obs_dim].clone()
+
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
         if env_ids.numel() > 0:
