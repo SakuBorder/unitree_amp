@@ -3,6 +3,7 @@ import os
 import numpy as np
 import torch
 from isaacgym import gymapi, gymtorch
+from isaacgym.torch_utils import torch_rand_float
 
 from TokenHSI.tokenhsi.utils import traj_generator, torch_utils
 from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
@@ -25,12 +26,23 @@ class G1TrajRobot(G1AMPRobot):
         self._sharp_turn_angle = cfg.traj.sharp_turn_angle
         self._traj_debug_enabled = cfg.traj.enable_debug_vis
 
+        # marker state placeholders (populated in _create_envs / _init_buffers)
+        self._traj_marker_asset = None
+        self._traj_marker_handles = None
+        self._traj_marker_states = None
+        self._traj_marker_pos = None
+        self._traj_marker_actor_ids = None
+        self._all_actor_root_states = None
+        self._actors_per_env = 1
+        self._robot_actor_ids = None
+
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
 
-        # Track the full actor root state tensor (all actors per env) so we can
-        # map trajectory markers alongside the robot base state.
-        self._all_actor_root_states = self.root_states
-        self._actors_per_env = self._all_actor_root_states.shape[0] // self.num_envs
+        # refresh robot/marker state views now that all actors exist
+        self._refresh_root_state_view()
+        if self._traj_marker_handles is not None:
+            self._build_marker_state_tensors()
+            self._build_marker_actor_ids()
 
         # cached samples (world/local) and time offsets
         self._traj_samples_world = torch.zeros(self.num_envs, self._num_traj_samples, 3, device=self.device, dtype=torch.float32)
@@ -45,22 +57,125 @@ class G1TrajRobot(G1AMPRobot):
         self._build_traj_generator()
         self._refresh_traj_buffers()
         self._update_traj_extras()
+        if self._traj_marker_pos is not None:
+            self._update_markers_from_samples()
 
-        # --- HumanoidTraj-style marker actors (red mini pillars) ---
-        self._traj_marker_asset = None
-        self._traj_marker_handles = None
-        self._traj_marker_states = None
-        self._traj_marker_pos = None
-        self._traj_marker_actor_ids = None  # Tensor[int32] in SIM domain
 
-        if not headless:
+    # -------------------- isaac gym overrides ----------
+    def _create_envs(self):
+        asset_path = self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        asset_root = os.path.dirname(asset_path)
+        asset_file = os.path.basename(asset_path)
+
+        asset_options = gymapi.AssetOptions()
+        asset_options.default_dof_drive_mode = self.cfg.asset.default_dof_drive_mode
+        asset_options.collapse_fixed_joints = self.cfg.asset.collapse_fixed_joints
+        asset_options.replace_cylinder_with_capsule = self.cfg.asset.replace_cylinder_with_capsule
+        asset_options.flip_visual_attachments = self.cfg.asset.flip_visual_attachments
+        asset_options.fix_base_link = self.cfg.asset.fix_base_link
+        asset_options.density = self.cfg.asset.density
+        asset_options.angular_damping = self.cfg.asset.angular_damping
+        asset_options.linear_damping = self.cfg.asset.linear_damping
+        asset_options.max_angular_velocity = self.cfg.asset.max_angular_velocity
+        asset_options.max_linear_velocity = self.cfg.asset.max_linear_velocity
+        asset_options.armature = self.cfg.asset.armature
+        asset_options.thickness = self.cfg.asset.thickness
+        asset_options.disable_gravity = self.cfg.asset.disable_gravity
+
+        robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+        self.num_dof = self.gym.get_asset_dof_count(robot_asset)
+        self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
+        dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
+        rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
+
+        body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        self.dof_names = self.gym.get_asset_dof_names(robot_asset)
+        self.num_bodies = len(body_names)
+        self.num_dofs = len(self.dof_names)
+
+        feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
+        penalized_contact_names = []
+        for name in self.cfg.asset.penalize_contacts_on:
+            penalized_contact_names.extend([s for s in body_names if name in s])
+        termination_contact_names = []
+        for name in self.cfg.asset.terminate_after_contacts_on:
+            termination_contact_names.extend([s for s in body_names if name in s])
+
+        base_init_state_list = (
+            self.cfg.init_state.pos
+            + self.cfg.init_state.rot
+            + self.cfg.init_state.lin_vel
+            + self.cfg.init_state.ang_vel
+        )
+        self.base_init_state = torch.tensor(base_init_state_list, device=self.device, dtype=torch.float32)
+        start_pose = gymapi.Transform()
+        start_pose.p = gymapi.Vec3(*self.base_init_state[:3])
+
+        self._get_env_origins()
+        env_lower = gymapi.Vec3(0.0, 0.0, 0.0)
+        env_upper = gymapi.Vec3(0.0, 0.0, 0.0)
+
+        self.actor_handles = []
+        self.envs = []
+
+        if not self.headless:
             self._traj_marker_handles = [[] for _ in range(self.num_envs)]
             self._load_marker_asset()
-            self._create_marker_actors()
-            self._refresh_root_state_view()
+
+        for i in range(self.num_envs):
+            env_handle = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
+            pos = self.env_origins[i].clone()
+            pos[:2] += torch_rand_float(-1.0, 1.0, (2, 1), device=self.device).squeeze(1)
+            start_pose.p = gymapi.Vec3(*pos)
+
+            rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)
+            self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
+            actor_handle = self.gym.create_actor(
+                env_handle,
+                robot_asset,
+                start_pose,
+                self.cfg.asset.name,
+                i,
+                self.cfg.asset.self_collisions,
+                0,
+            )
+
+            dof_props = self._process_dof_props(dof_props_asset, i)
+            self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
+
+            body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
+            body_props = self._process_rigid_body_props(body_props, i)
+            self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+
+            if self._traj_marker_handles is not None:
+                self._create_marker_actors(i, env_handle)
+
+            self.envs.append(env_handle)
+            self.actor_handles.append(actor_handle)
+
+        self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device)
+        for idx, name in enumerate(feet_names):
+            self.feet_indices[idx] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], name)
+
+        self.penalised_contact_indices = torch.zeros(len(penalized_contact_names), dtype=torch.long, device=self.device)
+        for idx, name in enumerate(penalized_contact_names):
+            self.penalised_contact_indices[idx] = self.gym.find_actor_rigid_body_handle(
+                self.envs[0], self.actor_handles[0], name
+            )
+
+        self.termination_contact_indices = torch.zeros(len(termination_contact_names), dtype=torch.long, device=self.device)
+        for idx, name in enumerate(termination_contact_names):
+            self.termination_contact_indices[idx] = self.gym.find_actor_rigid_body_handle(
+                self.envs[0], self.actor_handles[0], name
+            )
+
+
+    def _init_buffers(self):
+        super()._init_buffers()
+        self._refresh_root_state_view()
+        if self._traj_marker_handles is not None:
             self._build_marker_state_tensors()
             self._build_marker_actor_ids()
-            self._update_markers_from_samples()
 
 
     # -------------------- reward cfg --------------------
@@ -81,6 +196,76 @@ class G1TrajRobot(G1AMPRobot):
         return base_noise[..., :base_obs_dim].clone()
 
     # -------------------- resets ------------------------
+    def _reset_dofs(self, env_ids):
+        if len(env_ids) == 0:
+            return
+
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(
+            0.5, 1.5, (env_ids.numel(), self.num_dof), device=self.device
+        )
+        self.dof_vel[env_ids] = 0.0
+
+        actor_ids = self._robot_actor_ids[env_ids].to(dtype=torch.int32)
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(actor_ids),
+            actor_ids.numel(),
+        )
+
+    def _reset_root_states(self, env_ids):
+        if len(env_ids) == 0:
+            return
+
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        if self.custom_origins:
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+            self.root_states[env_ids, :2] += torch_rand_float(-1.0, 1.0, (env_ids.numel(), 2), device=self.device)
+        else:
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+
+        self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (env_ids.numel(), 6), device=self.device)
+
+        actor_ids = self._robot_actor_ids[env_ids].to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._all_actor_root_states),
+            gymtorch.unwrap_tensor(actor_ids),
+            actor_ids.numel(),
+        )
+
+    def _push_robots(self):
+        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        push_interval = int(self.cfg.domain_rand.push_interval)
+        push_mask = self.episode_length_buf[env_ids] % push_interval == 0
+        push_env_ids = env_ids[push_mask]
+        if push_env_ids.numel() == 0:
+            return
+
+        max_vel = self.cfg.domain_rand.max_push_vel_xy
+        self.root_states[push_env_ids, 7:9] = torch_rand_float(
+            -max_vel, max_vel, (push_env_ids.numel(), 2), device=self.device
+        )
+
+        actor_ids = self._robot_actor_ids[push_env_ids].to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._all_actor_root_states),
+            gymtorch.unwrap_tensor(actor_ids),
+            actor_ids.numel(),
+        )
+
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
         if env_ids.numel() > 0:
@@ -117,19 +302,26 @@ class G1TrajRobot(G1AMPRobot):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
 
-        # Root states for all actors (robot + markers) per environment.
-        self._all_actor_root_states = gymtorch.wrap_tensor(actor_root_state)
-        self._actors_per_env = self._all_actor_root_states.shape[0] // self.num_envs
-        actor_root_state_view = self._all_actor_root_states.view(
-            self.num_envs, self._actors_per_env, self._all_actor_root_states.shape[-1]
-        )
+        all_actor_states = gymtorch.wrap_tensor(actor_root_state)
+        self._all_actor_root_states = all_actor_states
+        self._actors_per_env = all_actor_states.shape[0] // self.num_envs
 
-        # The robot is always the first actor in each environment. Keep
-        # self.root_states as the per-env robot state tensor expected by the
-        # LeggedRobot base class.
+        actor_root_state_view = all_actor_states.view(
+            self.num_envs, self._actors_per_env, all_actor_states.shape[-1]
+        )
         self.root_states = actor_root_state_view[:, 0, :]
         self.base_pos = self.root_states[:, 0:3]
         self.base_quat = self.root_states[:, 3:7]
+
+        self._robot_actor_ids = (
+            torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
+        )
+
+        # Rebuild dependent buffers to match the robot-only view.
+        self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device, dtype=self.root_states.dtype)
+        self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device, dtype=self.root_states.dtype)
+        self.projected_gravity = torch.zeros(self.num_envs, 3, device=self.device, dtype=self.root_states.dtype)
+        self.last_root_vel = torch.zeros(self.num_envs, 6, device=self.device, dtype=self.root_states.dtype)
 
     def _reset_traj_follow_task(self, env_ids):
         if env_ids.numel() == 0:
@@ -204,38 +396,38 @@ class G1TrajRobot(G1AMPRobot):
         opts.default_dof_drive_mode = gymapi.DOF_MODE_NONE
         self._traj_marker_asset = self.gym.load_asset(self.sim, asset_root, asset_file, opts)
 
-    def _create_marker_actors(self):
+    def _create_marker_actors(self, env_idx, env_ptr):
         if self._traj_marker_handles is None:
             return
+        handles = self._traj_marker_handles[env_idx]
         default_pose = gymapi.Transform()
         col_group = self.num_envs + 10
         col_filter = 1
         segmentation_id = 0
-        for env_idx, env_ptr in enumerate(self.envs):
-            handles = self._traj_marker_handles[env_idx]
-            for _ in range(self._num_traj_samples):
-                h = self.gym.create_actor(
-                    env_ptr,
-                    self._traj_marker_asset,
-                    default_pose,
-                    "marker",
-                    col_group,
-                    col_filter,
-                    segmentation_id,
-                )
-                self.gym.set_actor_scale(env_ptr, h, 0.5)
-                self.gym.set_rigid_body_color(
-                    env_ptr, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0)
-                )
-                handles.append(h)
+        for _ in range(self._num_traj_samples):
+            handle = self.gym.create_actor(
+                env_ptr,
+                self._traj_marker_asset,
+                default_pose,
+                "marker",
+                col_group,
+                col_filter,
+                segmentation_id,
+            )
+            self.gym.set_actor_scale(env_ptr, handle, 0.5)
+            self.gym.set_rigid_body_color(
+                env_ptr, handle, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0)
+            )
+            handles.append(handle)
 
     def _build_marker_actor_ids(self):
         if self._traj_marker_handles is None:
             return
 
         handle_tensor = torch.tensor(self._traj_marker_handles, device=self.device, dtype=torch.int32)
-        base_actor_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
-        self._traj_marker_actor_ids = (base_actor_ids.unsqueeze(-1) + handle_tensor).flatten()
+        if self._robot_actor_ids is None:
+            self._robot_actor_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
+        self._traj_marker_actor_ids = (self._robot_actor_ids.unsqueeze(-1) + handle_tensor).flatten()
 
     def _build_marker_state_tensors(self):
         if self._traj_marker_handles is None:
