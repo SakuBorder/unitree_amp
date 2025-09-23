@@ -17,8 +17,7 @@ class G1TrajCfg(G1AMPCfg):
         pos_error_scale = 2.0
 
     class env(G1AMPCfg.env):
-        num_observations = G1AMPCfg.env.num_observations + 2 * traj.num_samples
-        num_privileged_obs = G1AMPCfg.env.num_privileged_obs + 2 * traj.num_samples
+        pass
 
     class rewards(G1AMPCfg.rewards):
         class scales(G1AMPCfg.rewards.scales):
@@ -29,3 +28,12 @@ class G1TrajCfgPPO(G1AMPCfgPPO):
     class runner(G1AMPCfgPPO.runner):
         experiment_name = "g1_traj"
         run_name = ""
+
+
+# Update the environment observation dimensions to include trajectory features.
+G1TrajCfg.env.num_observations = (
+    G1AMPCfg.env.num_observations + 2 * G1TrajCfg.traj.num_samples
+)
+G1TrajCfg.env.num_privileged_obs = (
+    G1AMPCfg.env.num_privileged_obs + 2 * G1TrajCfg.traj.num_samples
+)
