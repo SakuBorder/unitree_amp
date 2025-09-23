@@ -15,6 +15,9 @@ class G1TrajCfg(G1AMPCfg):
         sharp_turn_prob = 0.15
         sharp_turn_angle = math.pi / 2.0
         pos_error_scale = 2.0
+        enable_debug_vis = True
+        debug_height = 0.05
+        sample_marker_height = 0.15
 
     class env(G1AMPCfg.env):
         pass
