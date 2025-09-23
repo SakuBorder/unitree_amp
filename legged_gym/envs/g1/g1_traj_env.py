@@ -1,9 +1,17 @@
+import os
+
 import numpy as np
 import torch
 from isaacgym import gymapi, gymtorch
+from isaacgym.torch_utils import (
+    get_euler_xyz_in_tensor,
+    quat_rotate_inverse,
+    torch_rand_float,
+)
 
-from TokenHSI.tokenhsi.utils import traj_generator
+from TokenHSI.tokenhsi.utils import traj_generator, torch_utils
 from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
+from legged_gym import LEGGED_GYM_ROOT_DIR
 
 
 class G1TrajRobot(G1AMPRobot):
@@ -22,6 +30,16 @@ class G1TrajRobot(G1AMPRobot):
         self._sharp_turn_angle = cfg.traj.sharp_turn_angle
         self._traj_debug_enabled = cfg.traj.enable_debug_vis
 
+        # marker state placeholders (populated in _create_envs / _init_buffers)
+        self._traj_marker_asset = None
+        self._traj_marker_handles = None
+        self._traj_marker_states = None
+        self._traj_marker_pos = None
+        self._traj_marker_actor_ids = None
+        self._all_actor_root_states = None
+        self._actors_per_env = 1
+        self._robot_actor_ids = None
+
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
 
         # cached samples (world/local) and time offsets
@@ -37,15 +55,41 @@ class G1TrajRobot(G1AMPRobot):
         self._build_traj_generator()
         self._refresh_traj_buffers()
         self._update_traj_extras()
+        if self._traj_marker_pos is not None:
+            self._update_markers_from_samples()
 
-        # --- HumanoidTraj-style marker actors (red mini pillars) ---
-        self._traj_marker_asset = None
-        self._traj_marker_handles = []      # list[list[int]]
-        self._traj_marker_actor_ids = None  # Tensor[int32] in SIM domain
-        self._load_marker_asset()
-        self._create_marker_actors()
-        self._build_marker_actor_ids()
-        self._root_state_tensor = gymtorch.wrap_tensor(self.gym.acquire_actor_root_state_tensor(self.sim))
+
+    # -------------------- isaac gym overrides ----------
+    def _pre_create_envs(self, robot_asset):
+        super()._pre_create_envs(robot_asset)
+        if not self.headless:
+            self._traj_marker_handles = [[] for _ in range(self.num_envs)]
+            self._load_marker_asset()
+
+    def _build_env(
+        self,
+        env_id,
+        env_handle,
+        robot_asset,
+        start_pose,
+        rigid_shape_props_asset,
+        dof_props_asset,
+    ):
+        actor_handle = super()._build_env(
+            env_id, env_handle, robot_asset, start_pose, rigid_shape_props_asset, dof_props_asset
+        )
+        if self._traj_marker_handles is not None:
+            self._create_marker_actors(env_id, env_handle)
+        return actor_handle
+
+    def _init_buffers(self):
+        super()._init_buffers()
+        # Preserve the full actor state tensor before carving out the robot slice.
+        self._all_actor_root_states = self.root_states
+        self._refresh_root_state_view(initial=True)
+        if self._traj_marker_handles is not None:
+            self._build_marker_state_tensors()
+            self._build_marker_actor_ids()
 
 
     # -------------------- reward cfg --------------------
@@ -66,6 +110,76 @@ class G1TrajRobot(G1AMPRobot):
         return base_noise[..., :base_obs_dim].clone()
 
     # -------------------- resets ------------------------
+    def _reset_dofs(self, env_ids):
+        if len(env_ids) == 0:
+            return
+
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(
+            0.5, 1.5, (env_ids.numel(), self.num_dof), device=self.device
+        )
+        self.dof_vel[env_ids] = 0.0
+
+        actor_ids = self._robot_actor_ids[env_ids].to(dtype=torch.int32)
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self.dof_state),
+            gymtorch.unwrap_tensor(actor_ids),
+            actor_ids.numel(),
+        )
+
+    def _reset_root_states(self, env_ids):
+        if len(env_ids) == 0:
+            return
+
+        if not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        if self.custom_origins:
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+            self.root_states[env_ids, :2] += torch_rand_float(-1.0, 1.0, (env_ids.numel(), 2), device=self.device)
+        else:
+            self.root_states[env_ids] = self.base_init_state
+            self.root_states[env_ids, :3] += self.env_origins[env_ids]
+
+        self.root_states[env_ids, 7:13] = torch_rand_float(-0.5, 0.5, (env_ids.numel(), 6), device=self.device)
+
+        actor_ids = self._robot_actor_ids[env_ids].to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._all_actor_root_states),
+            gymtorch.unwrap_tensor(actor_ids),
+            actor_ids.numel(),
+        )
+
+    def _push_robots(self):
+        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        push_interval = int(self.cfg.domain_rand.push_interval)
+        push_mask = self.episode_length_buf[env_ids] % push_interval == 0
+        push_env_ids = env_ids[push_mask]
+        if push_env_ids.numel() == 0:
+            return
+
+        max_vel = self.cfg.domain_rand.max_push_vel_xy
+        self.root_states[push_env_ids, 7:9] = torch_rand_float(
+            -max_vel, max_vel, (push_env_ids.numel(), 2), device=self.device
+        )
+
+        actor_ids = self._robot_actor_ids[push_env_ids].to(dtype=torch.int32)
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._all_actor_root_states),
+            gymtorch.unwrap_tensor(actor_ids),
+            actor_ids.numel(),
+        )
+
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
         if env_ids.numel() > 0:
@@ -97,6 +211,35 @@ class G1TrajRobot(G1AMPRobot):
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         root_pos = self.root_states[env_ids, 0:3]
         self._traj_gen.reset(env_ids, root_pos)
+
+    def _refresh_root_state_view(self, initial=False):
+        if self._all_actor_root_states is None:
+            actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
+            self._all_actor_root_states = gymtorch.wrap_tensor(actor_root_state)
+
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+
+        all_actor_states = self._all_actor_root_states
+        self._actors_per_env = all_actor_states.shape[0] // self.num_envs
+        actor_root_state_view = all_actor_states.view(
+            self.num_envs, self._actors_per_env, all_actor_states.shape[-1]
+        )
+
+        self.root_states = actor_root_state_view[:, 0, :]
+        self.base_pos = self.root_states[:, 0:3]
+        self.base_quat = self.root_states[:, 3:7]
+        self.rpy = get_euler_xyz_in_tensor(self.base_quat)
+
+        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+
+        self._robot_actor_ids = (
+            torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
+        )
+
+        if initial or self.last_root_vel.shape[0] != self.num_envs:
+            self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
 
     def _reset_traj_follow_task(self, env_ids):
         if env_ids.numel() == 0:
@@ -153,7 +296,14 @@ class G1TrajRobot(G1AMPRobot):
 
     # -------------------- markers (HumanoidTraj style) --
     def _load_marker_asset(self):
-        asset_root = "/home/dy/dy/code/unitree_amp/assert/"
+        asset_root = os.path.join(
+            LEGGED_GYM_ROOT_DIR,
+            "TokenHSI",
+            "tokenhsi",
+            "data",
+            "assets",
+            "mjcf",
+        )
         asset_file = "location_marker.urdf"
         opts = gymapi.AssetOptions()
         opts.angular_damping = 0.01
@@ -164,57 +314,76 @@ class G1TrajRobot(G1AMPRobot):
         opts.default_dof_drive_mode = gymapi.DOF_MODE_NONE
         self._traj_marker_asset = self.gym.load_asset(self.sim, asset_root, asset_file, opts)
 
-    def _create_marker_actors(self):
+    def _create_marker_actors(self, env_idx, env_ptr):
+        if self._traj_marker_handles is None:
+            return
+        handles = self._traj_marker_handles[env_idx]
         default_pose = gymapi.Transform()
         col_group = self.num_envs + 10
         col_filter = 1
         segmentation_id = 0
-        self._traj_marker_handles = []
-        for env_ptr in self.envs:
-            handles = []
-            for _ in range(self._num_traj_samples):
-                h = self.gym.create_actor(env_ptr, self._traj_marker_asset, default_pose,
-                                          "marker", col_group, col_filter, segmentation_id)
-                self.gym.set_actor_scale(env_ptr, h, 0.5)
-                self.gym.set_rigid_body_color(env_ptr, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
-                handles.append(h)
-            self._traj_marker_handles.append(handles)
+        for _ in range(self._num_traj_samples):
+            handle = self.gym.create_actor(
+                env_ptr,
+                self._traj_marker_asset,
+                default_pose,
+                "marker",
+                col_group,
+                col_filter,
+                segmentation_id,
+            )
+            self.gym.set_actor_scale(env_ptr, handle, 0.5)
+            self.gym.set_rigid_body_color(
+                env_ptr, handle, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0)
+            )
+            handles.append(handle)
 
     def _build_marker_actor_ids(self):
-        ids = []
-        for env_idx, env_ptr in enumerate(self.envs):
-            for h in self._traj_marker_handles[env_idx]:
-                aid = self.gym.get_actor_index(env_ptr, h, gymapi.DOMAIN_SIM)  # ✅ (env, handle, domain)
-                ids.append(aid)
-        self._traj_marker_actor_ids = torch.tensor(ids, device=self.device, dtype=torch.int32)
+        if self._traj_marker_handles is None:
+            return
+
+        handle_tensor = torch.tensor(self._traj_marker_handles, device=self.device, dtype=torch.int32)
+        if self._robot_actor_ids is None:
+            self._robot_actor_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
+        self._traj_marker_actor_ids = (self._robot_actor_ids.unsqueeze(-1) + handle_tensor).flatten()
+
+    def _build_marker_state_tensors(self):
+        if self._traj_marker_handles is None or self._all_actor_root_states is None:
+            return
+
+        marker_start = 1
+        marker_end = marker_start + self._num_traj_samples
+        if marker_end > self._actors_per_env:
+            raise RuntimeError("Trajectory marker count exceeds actors per environment.")
+
+        root_states_view = self._all_actor_root_states.view(
+            self.num_envs, self._actors_per_env, self._all_actor_root_states.shape[-1]
+        )
+        self._traj_marker_states = root_states_view[:, marker_start:marker_end, :]
+        self._traj_marker_pos = self._traj_marker_states[..., :3]
+        marker_identity = self.root_states.new_tensor((0.0, 0.0, 0.0, 1.0))
+        self._traj_marker_states[..., 3:7] = marker_identity
+        self._traj_marker_states[..., 7:13] = 0.0
 
 
     def _update_markers_from_samples(self):
-        if self._traj_marker_actor_ids is None or self._traj_marker_actor_ids.numel() == 0:
+        if (
+            self._traj_marker_pos is None
+            or self._traj_marker_actor_ids is None
+            or self._traj_marker_actor_ids.numel() == 0
+            or self._all_actor_root_states is None
+        ):
             return
 
-        # 读/写前刷新一次
-        self.gym.refresh_actor_root_state_tensor(self.sim)
+        self._traj_marker_pos[:] = self._traj_samples_world
+        root_height = self.root_states[:, 2:3]
+        self._traj_marker_pos[..., 2] = root_height
 
-        # 把采样点的 Z 提到当前根高（视觉一致）
-        z = self.root_states[:, 2:3]  # [N,1]
-        samples = self._traj_samples_world.clone()
-        samples[..., 2] = z.repeat(1, self._num_traj_samples)
-
-        idx = self._traj_marker_actor_ids.long()        # [N * num_traj_samples]
-        pos = samples.reshape(-1, 3)
-
-        # 写入“仿真级” root state buffer 对应行
-        self._root_state_tensor[idx, 0:3] = pos
-        self._root_state_tensor[idx, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
-        self._root_state_tensor[idx, 7:13] = 0.0
-
-        # 用 indexed 下发（指向同一块仿真 root state buffer）
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
-            gymtorch.unwrap_tensor(self._root_state_tensor),
-            gymtorch.unwrap_tensor(idx),
-            idx.shape[0],
+            gymtorch.unwrap_tensor(self._all_actor_root_states),
+            gymtorch.unwrap_tensor(self._traj_marker_actor_ids),
+            len(self._traj_marker_actor_ids),
         )
 
 
@@ -245,24 +414,20 @@ class G1TrajRobot(G1AMPRobot):
 def compute_location_observations(root_states, traj_samples):
     num_envs = root_states.shape[0]
     num_samples = traj_samples.shape[1] if traj_samples.dim() >= 2 else 0
-    if num_envs == 0:
+    if num_envs == 0 or num_samples == 0:
         return traj_samples.new_zeros((0, num_samples, 2))
 
     root_pos = root_states[:, 0:3]
     root_rot = root_states[:, 3:7]
+    heading_rot = torch_utils.calc_heading_quat_inv(root_rot)
 
-    sin_yaw = 2.0 * (root_rot[:, 3] * root_rot[:, 2] + root_rot[:, 0] * root_rot[:, 1])
-    cos_yaw = 1.0 - 2.0 * (root_rot[:, 1] * root_rot[:, 1] + root_rot[:, 2] * root_rot[:, 2])
-    heading = torch.atan2(sin_yaw, cos_yaw)
+    heading_rot_exp = torch.broadcast_to(heading_rot.unsqueeze(1), (num_envs, num_samples, 4))
+    root_pos_exp = torch.broadcast_to(root_pos.unsqueeze(1), (num_envs, num_samples, 3))
 
-    cos_h = torch.cos(heading).unsqueeze(1)
-    sin_h = torch.sin(heading).unsqueeze(1)
+    local_traj_samples = torch_utils.quat_rotate(heading_rot_exp.reshape(-1, 4),
+                                                 traj_samples.reshape(-1, 3) - root_pos_exp.reshape(-1, 3))
 
-    delta = traj_samples[..., 0:2] - root_pos.unsqueeze(1)[..., 0:2]
-    x_local = cos_h * delta[..., 0] + sin_h * delta[..., 1]
-    y_local = -sin_h * delta[..., 0] + cos_h * delta[..., 1]
-
-    return torch.stack((x_local, y_local), dim=-1)
+    return local_traj_samples[..., 0:2].reshape(num_envs, num_samples, 2)
 
 
 @torch.jit.script
