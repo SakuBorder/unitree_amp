@@ -390,6 +390,7 @@ class AMPOnPolicyRunner:
                     )
 
                     task_reward_mean = rewards.mean().item()
+                    # print('task_reward_mean:',task_reward_mean)
                     style_reward_mean = style_rewards.mean().item()
                     mean_task_reward_log += task_reward_mean
                     mean_style_reward_log += style_reward_mean

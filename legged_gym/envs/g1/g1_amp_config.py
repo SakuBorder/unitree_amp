@@ -58,7 +58,7 @@ class G1AMPCfg(G1RoughCfg):
     class motion_lib:
         # Path to the motion library used for AMP demonstrations.  Users
         # should replace this with the path to their processed motion dataset.
-        motion_file = "/home/dy/dy/code/unitree_amp/data/g1_12/walk/"
+        motion_file = "/home/dy/dy/code/unitree_amp/data/g1_12_wtoe/walk/"
         # MJCF description used to build the skeleton that matches the motion
         # library.  The default points to the bundled G1 description.
         # mjcf_file = f"{LEGGED_GYM_ROOT_DIR}/resources/robots/g1_description/g1_12dof.xml"
@@ -116,20 +116,20 @@ class G1AMPCfgPPO(G1RoughCfgPPO):
     class policy(G1RoughCfgPPO.policy):
         # Explicitly state the policy network class used by the AMP runner.
         class_name = "ActorCritic"
-        actor_hidden_dims = [256, 256]
-        critic_hidden_dims = [256, 256]
+        actor_hidden_dims = [1024, 512]
+        critic_hidden_dims = [1024, 512]
 
     class algorithm(G1RoughCfgPPO.algorithm):
         # AMP integrates with PPO through the AMP_PPO algorithm.
         class_name = "AMP_PPO"
         learning_rate = 3.0e-4
-        num_learning_epochs = 4
-        num_mini_batches = 4
+        num_learning_epochs = 6
+        num_mini_batches = 8
 
     class discriminator:
         # Discriminator architecture closely follows common AMP practices.
-        hidden_dims = [256, 256]
-        reward_scale = 1.0
+        hidden_dims = [1024, 512]
+        reward_scale = 0.5
         loss_type = "BCEWithLogits"
         disc_logit_reg = 0.01
         disc_grad_penalty = 10.0
@@ -139,5 +139,5 @@ class G1AMPCfgPPO(G1RoughCfgPPO):
         policy_class_name = "ActorCritic"
         algorithm_class_name = "AMP_PPO"
         num_steps_per_env = 24
-        max_iterations = 10000
+        max_iterations = 50000
         experiment_name = "g1_amp"

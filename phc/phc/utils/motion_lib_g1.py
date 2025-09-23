@@ -34,7 +34,7 @@ def to_torch(tensor):
 
 
 
-USE_CACHE = False
+USE_CACHE = True
 print("MOVING MOTION DATA TO GPU, USING CACHE:", USE_CACHE)
 
 if not USE_CACHE:
