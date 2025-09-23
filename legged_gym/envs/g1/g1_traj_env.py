@@ -3,7 +3,11 @@ import os
 import numpy as np
 import torch
 from isaacgym import gymapi, gymtorch
-from isaacgym.torch_utils import torch_rand_float
+from isaacgym.torch_utils import (
+    get_euler_xyz_in_tensor,
+    quat_rotate_inverse,
+    torch_rand_float,
+)
 
 from TokenHSI.tokenhsi.utils import traj_generator, torch_utils
 from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
@@ -37,12 +41,6 @@ class G1TrajRobot(G1AMPRobot):
         self._robot_actor_ids = None
 
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
-
-        # refresh robot/marker state views now that all actors exist
-        self._refresh_root_state_view()
-        if self._traj_marker_handles is not None:
-            self._build_marker_state_tensors()
-            self._build_marker_actor_ids()
 
         # cached samples (world/local) and time offsets
         self._traj_samples_world = torch.zeros(self.num_envs, self._num_traj_samples, 3, device=self.device, dtype=torch.float32)
@@ -172,7 +170,9 @@ class G1TrajRobot(G1AMPRobot):
 
     def _init_buffers(self):
         super()._init_buffers()
-        self._refresh_root_state_view()
+        # Preserve the full actor state tensor before carving out the robot slice.
+        self._all_actor_root_states = self.root_states
+        self._refresh_root_state_view(initial=True)
         if self._traj_marker_handles is not None:
             self._build_marker_state_tensors()
             self._build_marker_actor_ids()
@@ -298,30 +298,34 @@ class G1TrajRobot(G1AMPRobot):
         root_pos = self.root_states[env_ids, 0:3]
         self._traj_gen.reset(env_ids, root_pos)
 
-    def _refresh_root_state_view(self):
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
+    def _refresh_root_state_view(self, initial=False):
+        if self._all_actor_root_states is None:
+            actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
+            self._all_actor_root_states = gymtorch.wrap_tensor(actor_root_state)
+
         self.gym.refresh_actor_root_state_tensor(self.sim)
 
-        all_actor_states = gymtorch.wrap_tensor(actor_root_state)
-        self._all_actor_root_states = all_actor_states
+        all_actor_states = self._all_actor_root_states
         self._actors_per_env = all_actor_states.shape[0] // self.num_envs
-
         actor_root_state_view = all_actor_states.view(
             self.num_envs, self._actors_per_env, all_actor_states.shape[-1]
         )
+
         self.root_states = actor_root_state_view[:, 0, :]
         self.base_pos = self.root_states[:, 0:3]
         self.base_quat = self.root_states[:, 3:7]
+        self.rpy = get_euler_xyz_in_tensor(self.base_quat)
+
+        self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
+        self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
         self._robot_actor_ids = (
             torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
         )
 
-        # Rebuild dependent buffers to match the robot-only view.
-        self.base_lin_vel = torch.zeros(self.num_envs, 3, device=self.device, dtype=self.root_states.dtype)
-        self.base_ang_vel = torch.zeros(self.num_envs, 3, device=self.device, dtype=self.root_states.dtype)
-        self.projected_gravity = torch.zeros(self.num_envs, 3, device=self.device, dtype=self.root_states.dtype)
-        self.last_root_vel = torch.zeros(self.num_envs, 6, device=self.device, dtype=self.root_states.dtype)
+        if initial or self.last_root_vel.shape[0] != self.num_envs:
+            self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
 
     def _reset_traj_follow_task(self, env_ids):
         if env_ids.numel() == 0:
@@ -430,11 +434,13 @@ class G1TrajRobot(G1AMPRobot):
         self._traj_marker_actor_ids = (self._robot_actor_ids.unsqueeze(-1) + handle_tensor).flatten()
 
     def _build_marker_state_tensors(self):
-        if self._traj_marker_handles is None:
+        if self._traj_marker_handles is None or self._all_actor_root_states is None:
             return
 
-        marker_start = self._traj_marker_handles[0][0]
+        marker_start = 1
         marker_end = marker_start + self._num_traj_samples
+        if marker_end > self._actors_per_env:
+            raise RuntimeError("Trajectory marker count exceeds actors per environment.")
 
         root_states_view = self._all_actor_root_states.view(
             self.num_envs, self._actors_per_env, self._all_actor_root_states.shape[-1]
