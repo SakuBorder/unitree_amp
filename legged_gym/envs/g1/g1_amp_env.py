@@ -1,7 +1,8 @@
 """AMP-enabled environment for the Unitree G1 humanoid."""
 
+import fnmatch
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -93,6 +94,146 @@ class G1AMPRobot(G1Robot):
         return obs0, obs1
 
     # ------------------------------------------------------------------
+    # Motion sampling utilities
+    # ------------------------------------------------------------------
+    def _ensure_iterable(self, value) -> Sequence:
+        if value is None:
+            return tuple()
+        if isinstance(value, (str, bytes)):
+            return (value,)
+        return tuple(value)
+
+    def _to_group_config(self, group) -> Mapping[str, object]:
+        if isinstance(group, Mapping):
+            return group
+        attrs = {}
+        for name in dir(group):
+            if name.startswith("_"):
+                continue
+            value = getattr(group, name)
+            if callable(value):
+                continue
+            attrs[name] = value
+        return attrs
+
+    def _build_motion_group_mask(
+        self,
+        keys: Sequence[str],
+        keys_lower: Sequence[str],
+        group_cfg: Mapping[str, object],
+    ) -> torch.Tensor:
+        device = self._motion_lib._device
+        mask = [False] * len(keys)
+
+        indices = group_cfg.get("indices")
+        if indices is not None:
+            for idx in self._ensure_iterable(indices):
+                try:
+                    mask[int(idx)] = True
+                except (TypeError, ValueError, IndexError):
+                    continue
+
+        patterns = group_cfg.get("patterns")
+        if patterns is None:
+            pattern = group_cfg.get("pattern")
+            if pattern is not None:
+                patterns = (pattern,)
+        for pattern in self._ensure_iterable(patterns):
+            pat = str(pattern)
+            pat_lower = pat.lower()
+            for idx, key_lower in enumerate(keys_lower):
+                if fnmatch.fnmatch(key_lower, pat_lower):
+                    mask[idx] = True
+
+        substrings = group_cfg.get("contains")
+        if substrings is None:
+            substrings = group_cfg.get("substrings")
+        for sub in self._ensure_iterable(substrings):
+            sub_lower = str(sub).lower()
+            if not sub_lower:
+                continue
+            for idx, key_lower in enumerate(keys_lower):
+                if sub_lower in key_lower:
+                    mask[idx] = True
+
+        return torch.tensor(mask, dtype=torch.bool, device=device)
+
+    def _apply_motion_sampling_groups(
+        self,
+        sampling_groups: Iterable[Mapping[str, object]],
+        default_weight: Optional[float],
+    ) -> Optional[Dict[str, object]]:
+        if not sampling_groups:
+            return None
+        if self._motion_lib is None:
+            return None
+
+        try:
+            raw_keys = list(self._motion_lib._motion_data_keys)
+        except AttributeError:
+            return None
+
+        clip_names = [str(key) for key in raw_keys]
+        if not clip_names:
+            return None
+
+        clip_names_lower = [name.lower() for name in clip_names]
+        device = self._motion_lib._device
+        weights = torch.zeros(len(clip_names), device=device, dtype=torch.float32)
+        matched = torch.zeros(len(clip_names), device=device, dtype=torch.bool)
+        summaries = []
+
+        for group in sampling_groups:
+            group_cfg = self._to_group_config(group)
+            weight = float(group_cfg.get("weight", 0.0))
+            if weight <= 0.0:
+                continue
+
+            mask = self._build_motion_group_mask(clip_names, clip_names_lower, group_cfg)
+            match_count = int(mask.sum().item())
+            group_name = group_cfg.get("name", "")
+            if match_count == 0:
+                summaries.append({"name": group_name, "matches": 0, "weight": weight})
+                continue
+
+            weights[mask] += weight / match_count
+            matched |= mask
+            summaries.append({"name": group_name, "matches": match_count, "weight": weight})
+
+        unmatched = (~matched).nonzero(as_tuple=False).flatten()
+        if unmatched.numel() > 0:
+            if default_weight is not None and default_weight > 0.0:
+                weights[unmatched] += default_weight / unmatched.numel()
+                summaries.append(
+                    {
+                        "name": "__default__",
+                        "matches": int(unmatched.numel()),
+                        "weight": float(default_weight),
+                    }
+                )
+            elif weights.sum() <= 0.0:
+                weights[:] = 1.0 / len(clip_names)
+            else:
+                # Allow unmatched clips but keep them with a very small mass so
+                # normalisation succeeds.  The scale does not matter because
+                # the distribution is renormalised below.
+                weights[unmatched] = weights[matched].mean() if matched.any() else 1.0
+
+        total = weights.sum()
+        if total <= 0.0:
+            weights[:] = 1.0 / len(clip_names)
+            total = 1.0
+
+        weights /= total
+        self._motion_lib._sampling_prob = weights
+
+        return {
+            "clip_names": clip_names,
+            "weights": weights.detach().cpu(),
+            "groups": summaries,
+        }
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     def _init_motion_lib(self):
@@ -135,6 +276,10 @@ class G1AMPRobot(G1Robot):
             sim_timestep=self.dt,
         )
 
+        sampling_groups = getattr(motion_cfg, "sampling_groups", ())
+        default_weight = getattr(motion_cfg, "default_sampling_weight", None)
+        sampling_summary = self._apply_motion_sampling_groups(sampling_groups, default_weight)
+
         # Build skeletons for motion loading.
         skeleton = SkeletonTree.from_mjcf(str(mjcf_path))
         num_motions = min(motion_cfg.num_motions_per_batch, self.num_envs)
@@ -147,6 +292,12 @@ class G1AMPRobot(G1Robot):
             limb_weights=limb_weights,
             random_sample=True,
         )
+
+        if sampling_summary is not None:
+            motion_extras = self.extras.setdefault("motion", {})
+            motion_extras["clip_names"] = sampling_summary["clip_names"]
+            motion_extras["sampling_weights"] = sampling_summary["weights"]
+            motion_extras["sampling_groups"] = sampling_summary["groups"]
 
         self._register_key_body_indices()
 
