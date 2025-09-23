@@ -1,4 +1,5 @@
 import os
+
 import numpy as np
 import torch
 from isaacgym import gymapi, gymtorch
@@ -25,6 +26,11 @@ class G1TrajRobot(G1AMPRobot):
         self._traj_debug_enabled = cfg.traj.enable_debug_vis
 
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
+
+        # Track the full actor root state tensor (all actors per env) so we can
+        # map trajectory markers alongside the robot base state.
+        self._all_actor_root_states = self.root_states
+        self._actors_per_env = self._all_actor_root_states.shape[0] // self.num_envs
 
         # cached samples (world/local) and time offsets
         self._traj_samples_world = torch.zeros(self.num_envs, self._num_traj_samples, 3, device=self.device, dtype=torch.float32)
@@ -110,9 +116,19 @@ class G1TrajRobot(G1AMPRobot):
     def _refresh_root_state_view(self):
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
-        # Update common views that depend on root_states
-        self.base_pos = self.root_states[:self.num_envs, 0:3]
+
+        # Root states for all actors (robot + markers) per environment.
+        self._all_actor_root_states = gymtorch.wrap_tensor(actor_root_state)
+        self._actors_per_env = self._all_actor_root_states.shape[0] // self.num_envs
+        actor_root_state_view = self._all_actor_root_states.view(
+            self.num_envs, self._actors_per_env, self._all_actor_root_states.shape[-1]
+        )
+
+        # The robot is always the first actor in each environment. Keep
+        # self.root_states as the per-env robot state tensor expected by the
+        # LeggedRobot base class.
+        self.root_states = actor_root_state_view[:, 0, :]
+        self.base_pos = self.root_states[:, 0:3]
         self.base_quat = self.root_states[:, 3:7]
 
     def _reset_traj_follow_task(self, env_ids):
@@ -217,25 +233,20 @@ class G1TrajRobot(G1AMPRobot):
         if self._traj_marker_handles is None:
             return
 
-        ids = []
-        for env_idx, env_ptr in enumerate(self.envs):
-            for h in self._traj_marker_handles[env_idx]:
-                aid = self.gym.get_actor_index(env_ptr, h, gymapi.DOMAIN_SIM)
-                ids.append(aid)
-        if ids:
-            self._traj_marker_actor_ids = torch.tensor(ids, device=self.device, dtype=torch.int32)
-        else:
-            self._traj_marker_actor_ids = None
+        handle_tensor = torch.tensor(self._traj_marker_handles, device=self.device, dtype=torch.int32)
+        base_actor_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.int32) * self._actors_per_env
+        self._traj_marker_actor_ids = (base_actor_ids.unsqueeze(-1) + handle_tensor).flatten()
 
     def _build_marker_state_tensors(self):
         if self._traj_marker_handles is None:
             return
 
-        num_actors = self.gym.get_actor_count(self.envs[0])
-        marker_start = 1  # robot actor occupies slot 0
+        marker_start = self._traj_marker_handles[0][0]
         marker_end = marker_start + self._num_traj_samples
 
-        root_states_view = self.root_states.view(self.num_envs, num_actors, self.root_states.shape[-1])
+        root_states_view = self._all_actor_root_states.view(
+            self.num_envs, self._actors_per_env, self._all_actor_root_states.shape[-1]
+        )
         self._traj_marker_states = root_states_view[:, marker_start:marker_end, :]
         self._traj_marker_pos = self._traj_marker_states[..., :3]
         marker_identity = self.root_states.new_tensor((0.0, 0.0, 0.0, 1.0))
@@ -244,7 +255,12 @@ class G1TrajRobot(G1AMPRobot):
 
 
     def _update_markers_from_samples(self):
-        if self._traj_marker_pos is None or self._traj_marker_actor_ids is None:
+        if (
+            self._traj_marker_pos is None
+            or self._traj_marker_actor_ids is None
+            or self._traj_marker_actor_ids.numel() == 0
+            or self._all_actor_root_states is None
+        ):
             return
 
         self._traj_marker_pos[:] = self._traj_samples_world
@@ -253,7 +269,7 @@ class G1TrajRobot(G1AMPRobot):
 
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
+            gymtorch.unwrap_tensor(self._all_actor_root_states),
             gymtorch.unwrap_tensor(self._traj_marker_actor_ids),
             len(self._traj_marker_actor_ids),
         )
