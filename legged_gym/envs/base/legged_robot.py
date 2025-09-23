@@ -517,6 +517,42 @@ class LeggedRobot(BaseTask):
         plane_params.restitution = self.cfg.terrain.restitution
         self.gym.add_ground(self.sim, plane_params)
 
+    def _pre_create_envs(self, robot_asset):
+        """Hook to load additional assets or state before creating environments."""
+        return
+
+    def _build_env(self, env_id, env_handle, robot_asset, start_pose, rigid_shape_props_asset, dof_props_asset):
+        """Create the primary robot actor for a single environment.
+
+        Subclasses can extend this to attach additional actors while preserving the
+        base actor ordering by calling ``super()._build_env(...)`` first.
+        """
+        rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, env_id)
+        self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
+
+        actor_handle = self.gym.create_actor(
+            env_handle,
+            robot_asset,
+            start_pose,
+            self.cfg.asset.name,
+            env_id,
+            self.cfg.asset.self_collisions,
+            0,
+        )
+
+        dof_props = self._process_dof_props(dof_props_asset, env_id)
+        self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
+
+        body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
+        body_props = self._process_rigid_body_props(body_props, env_id)
+        self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+
+        return actor_handle
+
+    def _post_create_envs(self, robot_asset):
+        """Hook executed after all environments have been created."""
+        return
+
     def _create_envs(self):
         """ Creates environments:
              1. loads the robot URDF/MJCF asset,
@@ -572,6 +608,8 @@ class LeggedRobot(BaseTask):
         self._get_env_origins()
         env_lower = gymapi.Vec3(0., 0., 0.)
         env_upper = gymapi.Vec3(0., 0., 0.)
+        self._pre_create_envs(robot_asset)
+
         self.actor_handles = []
         self.envs = []
         for i in range(self.num_envs):
@@ -580,17 +618,12 @@ class LeggedRobot(BaseTask):
             pos = self.env_origins[i].clone()
             pos[:2] += torch_rand_float(-1., 1., (2,1), device=self.device).squeeze(1)
             start_pose.p = gymapi.Vec3(*pos)
-                
-            rigid_shape_props = self._process_rigid_shape_props(rigid_shape_props_asset, i)
-            self.gym.set_asset_rigid_shape_properties(robot_asset, rigid_shape_props)
-            actor_handle = self.gym.create_actor(env_handle, robot_asset, start_pose, self.cfg.asset.name, i, self.cfg.asset.self_collisions, 0)
-            dof_props = self._process_dof_props(dof_props_asset, i)
-            self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
-            body_props = self.gym.get_actor_rigid_body_properties(env_handle, actor_handle)
-            body_props = self._process_rigid_body_props(body_props, i)
-            self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
+
+            actor_handle = self._build_env(i, env_handle, robot_asset, start_pose, rigid_shape_props_asset, dof_props_asset)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
+
+        self._post_create_envs(robot_asset)
 
         self.feet_indices = torch.zeros(len(feet_names), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(feet_names)):
