@@ -9,6 +9,14 @@ class G1CarryCfg(G1TrajCfg):
         ang_vel_penalty_scale = 1.5
         lateral_vel_penalty_scale = 1.0
 
+    class motion_lib(G1TrajCfg.motion_lib):
+        sampling_groups = (
+            {"name": "carryWith", "contains": ("carrywith",), "weight": 0.6},
+            {"name": "pickUp", "contains": ("pickup",), "weight": 0.25},
+            {"name": "loco", "contains": ("loco", "walk"), "weight": 0.15},
+        )
+        default_sampling_weight = 0.0
+
     class rewards(G1TrajCfg.rewards):
         class scales(G1TrajCfg.rewards.scales):
             carry_height = 0.75

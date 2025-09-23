@@ -8,6 +8,13 @@ class G1ClimbCfg(G1AMPCfg):
         height_range = (0.6, 1.2)
         height_error_scale = 6.0
 
+    class motion_lib(G1AMPCfg.motion_lib):
+        sampling_groups = (
+            {"name": "climb", "contains": ("climb",), "weight": 0.7},
+            {"name": "loco", "contains": ("loco", "walk"), "weight": 0.3},
+        )
+        default_sampling_weight = 0.0
+
     class env(G1AMPCfg.env):
         pass
 
