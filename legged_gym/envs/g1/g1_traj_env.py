@@ -56,6 +56,20 @@ class G1TrajRobot(G1AMPRobot):
         self._update_traj_extras()
 
     # ------------------------------------------------------------------
+    # Reward configuration
+    # ------------------------------------------------------------------
+    def _prepare_reward_function(self):
+        """Keep the trajectory reward on the same scale as TokenHSI."""
+
+        super()._prepare_reward_function()
+        if "traj_tracking" in self.reward_scales:
+            # TokenHSI accumulates the exponential tracking reward without an
+            # additional dt factor.  The base legged robot environment
+            # multiplies every scale by dt during setup, so undo that for the
+            # trajectory term to mirror the original magnitude.
+            self.reward_scales["traj_tracking"] /= self.dt
+
+    # ------------------------------------------------------------------
     # Noise handling
     # ------------------------------------------------------------------
     def _get_noise_scale_vec(self, cfg):
@@ -227,7 +241,12 @@ def compute_location_observations(root_states, traj_samples):
     return obs
 
 
-def compute_traj_reward(root_pos, tar_pos, pos_err_scale):
+@torch.jit.script
+def compute_traj_reward(
+    root_pos: torch.Tensor,
+    tar_pos: torch.Tensor,
+    pos_err_scale: float,
+) -> torch.Tensor:
     pos_diff = tar_pos[..., 0:2] - root_pos[..., 0:2]
     pos_err = torch.sum(pos_diff * pos_diff, dim=-1)
     return torch.exp(-pos_err_scale * pos_err)
