@@ -74,6 +74,14 @@ class G1AMPCfg(G1RoughCfg):
         # G1 motions already include the desired height, so no additional
         # height correction is required.
         fix_height_mode = "no_fix"
+        # Optional weighting of motion clips by matching filename patterns.
+        # Each entry should be a mapping containing a "weight" value and
+        # optional matching rules ("patterns", "contains", or "indices").
+        sampling_groups = ()
+        # Fallback weight assigned uniformly to any motions that do not match
+        # the configured sampling groups.  ``None`` keeps the default uniform
+        # distribution for unmatched clips.
+        default_sampling_weight = None
 
     class rewards( LeggedRobotCfg.rewards ):
         soft_dof_pos_limit = 0.9

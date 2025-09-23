@@ -45,6 +45,8 @@ class G1TrajRobot(G1AMPRobot):
         self._load_marker_asset()
         self._create_marker_actors()
         self._build_marker_actor_ids()
+        self._root_state_tensor = gymtorch.wrap_tensor(self.gym.acquire_actor_root_state_tensor(self.sim))
+
 
     # -------------------- reward cfg --------------------
     def _prepare_reward_function(self):
@@ -182,32 +184,39 @@ class G1TrajRobot(G1AMPRobot):
         ids = []
         for env_idx, env_ptr in enumerate(self.envs):
             for h in self._traj_marker_handles[env_idx]:
-                # 修复：移除 self.sim 参数，正确的参数顺序是 (env_ptr, actor_handle, domain)
-                aid = self.gym.get_actor_index(env_ptr, h, gymapi.DOMAIN_SIM)
+                aid = self.gym.get_actor_index(env_ptr, h, gymapi.DOMAIN_SIM)  # ✅ (env, handle, domain)
                 ids.append(aid)
         self._traj_marker_actor_ids = torch.tensor(ids, device=self.device, dtype=torch.int32)
+
 
     def _update_markers_from_samples(self):
         if self._traj_marker_actor_ids is None or self._traj_marker_actor_ids.numel() == 0:
             return
-        # 提到当前根高度
+
+        # 读/写前刷新一次
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+
+        # 把采样点的 Z 提到当前根高（视觉一致）
         z = self.root_states[:, 2:3]  # [N,1]
         samples = self._traj_samples_world.clone()
         samples[..., 2] = z.repeat(1, self._num_traj_samples)
 
-        num_total = self.num_envs * self._num_traj_samples
-        states = torch.zeros((num_total, 13), device=self.device, dtype=torch.float32)
-        states[:, 0:3] = samples.reshape(-1, 3)
-        states[:, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        idx = self._traj_marker_actor_ids.long()        # [N * num_traj_samples]
+        pos = samples.reshape(-1, 3)
 
-        # 将 marker 状态写入全局 root state，再按索引下发
-        self.root_states[self._traj_marker_actor_ids.long()] = states
+        # 写入“仿真级” root state buffer 对应行
+        self._root_state_tensor[idx, 0:3] = pos
+        self._root_state_tensor[idx, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        self._root_state_tensor[idx, 7:13] = 0.0
+
+        # 用 indexed 下发（指向同一块仿真 root state buffer）
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
-            gymtorch.unwrap_tensor(self._traj_marker_actor_ids),
-            self._traj_marker_actor_ids.shape[0]
+            gymtorch.unwrap_tensor(self._root_state_tensor),
+            gymtorch.unwrap_tensor(idx),
+            idx.shape[0],
         )
+
 
     # -------------------- rendering ---------------------
     def render(self, sync_frame_time=True):

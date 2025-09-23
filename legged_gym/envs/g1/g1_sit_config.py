@@ -12,6 +12,13 @@ class G1SitCfg(G1AMPCfg):
         velocity_penalty_scale = 2.0
         ang_vel_penalty_scale = 0.5
 
+    class motion_lib(G1AMPCfg.motion_lib):
+        sampling_groups = (
+            {"name": "sit", "contains": ("sit",), "weight": 0.7},
+            {"name": "loco", "contains": ("loco", "walk"), "weight": 0.3},
+        )
+        default_sampling_weight = 0.0
+
     class env(G1AMPCfg.env):
         pass
 
