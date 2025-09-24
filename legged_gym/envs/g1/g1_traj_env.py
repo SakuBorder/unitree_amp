@@ -52,12 +52,30 @@ class G1TrajRobot(G1AMPRobot):
 
     # -------------------- noise -------------------------
     def _get_noise_scale_vec(self, cfg):
+        """Return a noise vector that only spans the proprioceptive observations.
+
+        ``LeggedRobot`` expects ``self.noise_scale_vec`` to match the width of the
+        observation tensor that is assembled inside ``G1Robot.compute_observations``.
+        For the trajectory task we append additional features *after* that base call,
+        so only the proprioceptive slice should receive stochastic perturbations.
+
+        If we were to return the full trajectory-extended length here (as the parent
+        implementation does by default) the later noise application would attempt to
+        add tensors of mismatched widths, triggering the runtime error observed
+        during initialisation.
         """
-        关键修复点：
-        返回“本体观测长度”的噪声向量，交由基类在 super().compute_observations() 阶段加噪。
-        轨迹拼接部分不加噪（与 HumanoidTraj 习惯一致）。
-        """
-        return super()._get_noise_scale_vec(cfg)
+
+        base_noise = super()._get_noise_scale_vec(cfg)
+        base_obs_dim = cfg.env.num_observations - 2 * cfg.traj.num_samples
+        if base_obs_dim <= 0:
+            raise ValueError(
+                "Trajectory task must reserve proprioceptive observations before task features."
+            )
+        if base_noise.shape[-1] < base_obs_dim:
+            raise RuntimeError(
+                "Base noise vector shorter than proprioceptive observation width."
+            )
+        return base_noise[..., :base_obs_dim].clone()
 
     # -------------------- resets ------------------------
     def reset_idx(self, env_ids):
