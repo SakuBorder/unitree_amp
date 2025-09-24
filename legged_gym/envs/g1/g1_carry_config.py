@@ -1,12 +1,11 @@
-from legged_gym import LEGGED_GYM_ROOT_DIR
-from legged_gym.envs.g1.g1_config import G1RoughCfg, G1RoughCfgPPO
+from legged_gym.envs.g1.g1_amp_config import G1AMPCfg, G1AMPCfgPPO
 
-class G1CarryCfg(G1RoughCfg):
+class G1CarryCfg(G1AMPCfg):
     """G1搬运任务配置"""
     
-    class env(G1RoughCfg.env):
-        num_observations = 47 + 30  # 基础观测 + 任务观测
-        num_privileged_obs = 50 + 30
+    class env(G1AMPCfg.env):
+        num_observations = G1AMPCfg.env.num_observations + 42  # 基础观测 + 任务观测
+        num_privileged_obs = G1AMPCfg.env.num_privileged_obs + 42
         enableTaskObs = True
         onlyVelReward = False
         onlyHeightHandHeldReward = False
@@ -38,8 +37,8 @@ class G1CarryCfg(G1RoughCfg):
         class obs:
             enableBboxObs = True
             
-    class rewards(G1RoughCfg.rewards):
-        class scales(G1RoughCfg.rewards.scales):
+    class rewards(G1AMPCfg.rewards):
+        class scales(G1AMPCfg.rewards.scales):
             # 保留原有奖励
             tracking_lin_vel = 0.5  # 降低权重
             tracking_ang_vel = 0.25
@@ -50,7 +49,7 @@ class G1CarryCfg(G1RoughCfg):
             putdown = 1.0
             box_orientation = -1.0
 
-class G1CarryCfgPPO(G1RoughCfgPPO):
-    class runner(G1RoughCfgPPO.runner):
-        experiment_name = 'g1_carry'
+class G1CarryCfgPPO(G1AMPCfgPPO):
+    class runner(G1AMPCfgPPO.runner):
+        experiment_name = "g1_carry"
         max_iterations = 20000

@@ -30,9 +30,18 @@ class LeggedRobot(BaseTask):
         self.enable_markers: bool = bool(getattr(self.cfg, "traj", None) and getattr(self.cfg.traj, "enable_markers", False))
         self.num_markers: int = int(getattr(self.cfg.traj, "num_samples", 0) if self.enable_markers else 0)
 
+        # ===== 额外 actor 管理 =====
+        # 子类（如携带、攀爬、坐下任务）可在 super().__init__ 之前设置 extra_actors_per_env。
+        # 这里读取并规范化该属性，确保 LeggedRobot 统一维护 actors_per_env。
+        self.extra_actors_per_env: int = int(getattr(self, "extra_actors_per_env", 0))
+
         # 必须在 create_sim 前确定 actors_per_env
-        self.actors_per_env = 1 + (self.num_markers if self.enable_markers else 0)
-        print(f"[LeggedRobot] actors_per_env={self.actors_per_env} (markers enabled={self.enable_markers}, count={self.num_markers})")
+        base_actors = 1 + (self.num_markers if self.enable_markers else 0)
+        self.actors_per_env = base_actors + self.extra_actors_per_env
+        print(
+            "[LeggedRobot] actors_per_env="
+            f"{self.actors_per_env} (markers={self.num_markers}, extra={self.extra_actors_per_env})"
+        )
 
         # 这些在 _create_envs/_init_buffers 中赋值
         self.marker_asset = None
@@ -45,7 +54,11 @@ class LeggedRobot(BaseTask):
         self.marker_pos = None            # view [E, M, 3]
         self.robot_actor_ids = []         # (num_envs,) SIM 行号
         self.robot_rows = None            # torch int32 (num_envs,)
+        self._actor_row_base = None       # base rows for each env (int32)
 
+        # 初始化域随机化所需的张量（参考文档3）
+        self.num_actions = getattr(cfg.env, 'num_actions', 12)  # 默认值
+        
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
 
@@ -124,6 +137,15 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= self.time_out_buf
 
     def reset_idx(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        
+        # 越界检查（参考文档3）
+        if len(env_ids) > 0:
+            bad = (env_ids < 0) | (env_ids >= self.num_envs)
+            if torch.any(bad):
+                print(f"[FATAL] env_ids out of range: min={int(env_ids.min())}, max={int(env_ids.max())}, num_envs={self.num_envs}")
+                env_ids = env_ids[~bad]
         if len(env_ids) == 0:
             return
 
@@ -215,6 +237,30 @@ class LeggedRobot(BaseTask):
                 r = self.dof_pos_limits[i, 1] - self.dof_pos_limits[i, 0]
                 self.dof_pos_limits[i, 0] = m - 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
                 self.dof_pos_limits[i, 1] = m + 0.5 * r * self.cfg.rewards.soft_dof_pos_limit
+
+        # 域随机化功能（参考文档3的实现）
+        if hasattr(self.cfg.domain_rand, 'randomize_calculated_torque') and self.cfg.domain_rand.randomize_calculated_torque:
+            self.torque_multiplier[env_id,:] = torch_rand_float(
+                self.cfg.domain_rand.torque_multiplier_range[0], 
+                self.cfg.domain_rand.torque_multiplier_range[1], 
+                (1,self.num_actions), device=self.device)
+
+        if hasattr(self.cfg.domain_rand, 'randomize_motor_zero_offset') and self.cfg.domain_rand.randomize_motor_zero_offset:
+            self.motor_zero_offsets[env_id, :] = torch_rand_float(
+                self.cfg.domain_rand.motor_zero_offset_range[0], 
+                self.cfg.domain_rand.motor_zero_offset_range[1], 
+                (1,self.num_actions), device=self.device)
+        
+        if hasattr(self.cfg.domain_rand, 'randomize_pd_gains') and self.cfg.domain_rand.randomize_pd_gains:
+            self.p_gains_multiplier[env_id, :] = torch_rand_float(
+                self.cfg.domain_rand.stiffness_multiplier_range[0], 
+                self.cfg.domain_rand.stiffness_multiplier_range[1], 
+                (1,self.num_actions), device=self.device)
+            self.d_gains_multiplier[env_id, :] = torch_rand_float(
+                self.cfg.domain_rand.damping_multiplier_range[0], 
+                self.cfg.domain_rand.damping_multiplier_range[1], 
+                (1,self.num_actions), device=self.device)
+
         return props
 
     def _process_rigid_body_props(self, props, env_id):
@@ -257,29 +303,42 @@ class LeggedRobot(BaseTask):
         return torch.clip(torques, -self.torque_limits, self.torque_limits)
 
     def _reset_dofs(self, env_ids):
+        """参考文档3的实现，使用全量提交避免GPU稀疏写越界"""
         self.dof_pos[env_ids] = self.default_dof_pos * torch_rand_float(0.5, 1.5, (len(env_ids), self.num_dof), device=self.device)
         self.dof_vel[env_ids] = 0.
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
-        self.gym.set_dof_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.dof_state),
-            gymtorch.unwrap_tensor(env_ids_int32),
-            env_ids_int32.numel()
-        )
+        
+        # 使用全量提交（参考文档3）
+        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
+        self.gym.refresh_dof_state_tensor(self.sim)
 
     def _reset_root_states(self, env_ids):
+        """修正版本：参考文档3的实现，增加完整的错误检查和处理"""
         if len(env_ids) == 0:
             return
+            
         if not torch.is_tensor(env_ids):
             env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         else:
-            env_ids = env_ids.to(self.device, dtype=torch.long)
+            # 确保device和dtype正确
+            if env_ids.device != self.device:
+                env_ids = env_ids.to(self.device)
+            if env_ids.dtype != torch.long:
+                env_ids = env_ids.to(torch.long)
 
-        # robot 在 flat root 中的 SIM 行号
-        if hasattr(self, "robot_rows") and len(self.robot_rows) == self.num_envs:
+        # 机器人行号（SIM 域）- 参考文档3的逻辑
+        if hasattr(self, "robot_rows") and self.robot_rows is not None and len(self.robot_rows) == self.num_envs:
             actor_rows = self.robot_rows.index_select(0, env_ids).to(dtype=torch.int32)
         else:
             actor_rows = (env_ids.to(dtype=torch.int32) * self.actors_per_env)
+
+        # 越界保护（参考文档3）
+        num_total_actors = self._root_state_gymtensor.shape[0]
+        if actor_rows.numel() > 0:
+            min_row = int(actor_rows.min().item())
+            max_row = int(actor_rows.max().item())
+            if min_row < 0 or max_row >= num_total_actors:
+                print(f"[FATAL] robot_rows out of range: min={min_row}, max={max_row}, total={num_total_actors}")
+                return
 
         # 生成初始状态
         B = env_ids.shape[0]
@@ -289,9 +348,13 @@ class LeggedRobot(BaseTask):
             base_states[:, :2] += torch_rand_float(-1., 1., (B, 2), device=self.device)
         base_states[:, 7:13] = torch_rand_float(-0.5, 0.5, (B, 6), device=self.device)
 
-        # 写回 & 提交
+        # 写入扁平 root-state（确保device匹配）
         root_flat = self._root_state_gymtensor
+        if actor_rows.device != root_flat.device:
+            actor_rows = actor_rows.to(root_flat.device)
         root_flat.index_copy_(0, actor_rows.long(), base_states)
+
+        # 提交
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             self._root_state_ptr,
@@ -307,10 +370,13 @@ class LeggedRobot(BaseTask):
             return
         max_vel = self.cfg.domain_rand.max_push_vel_xy
         self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device)
-        if hasattr(self, "robot_rows"):
+        
+        # 使用正确的robot_rows（参考文档3）
+        if hasattr(self, "robot_rows") and self.robot_rows is not None:
             actor_rows = self.robot_rows.index_select(0, push_env_ids.to(torch.long)).to(dtype=torch.int32)
         else:
             actor_rows = (push_env_ids.to(dtype=torch.int32) * self.actors_per_env)
+            
         self.gym.set_actor_root_state_tensor_indexed(
             self.sim,
             self._root_state_ptr,
@@ -336,6 +402,7 @@ class LeggedRobot(BaseTask):
 
     #----------------------------------------
     def _init_buffers(self):
+        """修正版本：参考文档3的实现逻辑"""
         # 获取 gym 原生张量
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
@@ -349,11 +416,19 @@ class LeggedRobot(BaseTask):
         self._root_state_ptr = gymtorch.unwrap_tensor(self._root_state_gymtensor)
         self.root_state_tensor = self._root_state_gymtensor
 
-        # 形状检查
+        # 验证actors_per_env设置（参考文档3）
+        if not hasattr(self, 'actors_per_env'):
+            self.actors_per_env = 1
+            print("Warning: actors_per_env not set, defaulting to 1")
         expected = self.num_envs * self.actors_per_env
         actual = self.root_state_tensor.shape[0]
+        print(f"_init_buffers: num_envs={self.num_envs}, actors_per_env={self.actors_per_env}")
+        print(f"Root tensor shape: {self.root_state_tensor.shape}, expected: {expected}")
         if actual != expected:
-            raise RuntimeError(f"Root tensor shape mismatch! Expected {expected}, got {actual}.")
+            raise RuntimeError(
+                f"Root tensor shape mismatch! Expected {expected}, got {actual}. "
+                f"Check actor creation per env (robot + markers + extra)."
+            )
 
         # 视图: [E, A, 13]
         self.all_root_states = self.root_state_tensor.view(self.num_envs, self.actors_per_env, 13)
@@ -367,10 +442,16 @@ class LeggedRobot(BaseTask):
             self.marker_states[..., 7:13] = 0.0
 
         device = self.device if hasattr(self, "device") else self.sim_device
+        # 正确初始化robot_rows（参考文档3）
         if hasattr(self, "robot_actor_ids") and len(self.robot_actor_ids) == self.num_envs:
             self.robot_rows = torch.as_tensor(self.robot_actor_ids, device=device, dtype=torch.int32).contiguous()
         else:
             self.robot_rows = (torch.arange(self.num_envs, device=device, dtype=torch.int32) * self.actors_per_env)
+
+        # 每个环境在 root tensor 中的起始行号。
+        self._actor_row_base = torch.arange(
+            self.num_envs, device=device, dtype=torch.int32
+        ) * self.actors_per_env
 
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
@@ -403,6 +484,12 @@ class LeggedRobot(BaseTask):
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
+        # 初始化域随机化所需的张量（参考文档3）
+        self.torque_multiplier   = torch.ones(self.num_envs, self.num_actions, device=self.device)
+        self.motor_zero_offsets  = torch.zeros(self.num_envs, self.num_actions, device=self.device)
+        self.p_gains_multiplier  = torch.ones(self.num_envs, self.num_actions, device=self.device)
+        self.d_gains_multiplier  = torch.ones(self.num_envs, self.num_actions, device=self.device)
+
         # 默认关节与 PD
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
         for i in range(self.num_dofs):
@@ -422,6 +509,7 @@ class LeggedRobot(BaseTask):
                     print(f"PD gain of joint {name} were not defined, setting them to zero")
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
 
+        # 可选调试信息（参考文档3）
     def _prepare_reward_function(self):
         for key in list(self.reward_scales.keys()):
             scale = self.reward_scales[key]
@@ -467,6 +555,7 @@ class LeggedRobot(BaseTask):
             self.marker_asset = self.gym.create_box(self.sim, 0.05, 0.05, 0.05, opts)
 
     def _create_envs(self):
+        """ 修正版本：参考文档3的完整实现，确保actor创建顺序正确 """
         asset_path = self.cfg.asset.file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
         asset_root = os.path.dirname(asset_path)
         asset_file = os.path.basename(asset_path)
@@ -497,6 +586,10 @@ class LeggedRobot(BaseTask):
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
         self.num_bodies = len(body_names)
         self.num_dofs = len(self.dof_names)
+        
+        # 确保num_actions正确设置
+        if not hasattr(self, 'num_actions') or self.num_actions != self.num_dof:
+            self.num_actions = self.num_dof
 
         feet_names = [s for s in body_names if self.cfg.asset.foot_name in s]
         penalized_contact_names = []
@@ -664,7 +757,67 @@ class LeggedRobot(BaseTask):
     def _reward_feet_contact_forces(self):
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
 
-    # ======================== Marker 更新（给轨迹任务复用） ========================
+    # ======================== 额外 actor 工具 ========================
+    def _ensure_actor_row_base(self):
+        if self._actor_row_base is None or self._actor_row_base.shape[0] != self.num_envs:
+            device = self.device if hasattr(self, "device") else "cpu"
+            self._actor_row_base = (
+                torch.arange(self.num_envs, device=device, dtype=torch.int32)
+                * self.actors_per_env
+            )
+
+    def get_actor_row_indices(self, actor_offset: int) -> torch.Tensor:
+        self._ensure_actor_row_base()
+        offset = int(actor_offset)
+        if offset < 0 or offset >= self.actors_per_env:
+            raise ValueError(f"actor_offset {actor_offset} out of range [0, {self.actors_per_env})")
+        return self._actor_row_base + offset
+
+    def get_extra_actor_offset(self, extra_index: int) -> int:
+        if self.extra_actors_per_env <= 0:
+            raise RuntimeError("No extra actors registered in this environment")
+        if extra_index < 0 or extra_index >= self.extra_actors_per_env:
+            raise IndexError(
+                f"extra_index {extra_index} invalid for {self.extra_actors_per_env} extra actors"
+            )
+        return self.actors_per_env - self.extra_actors_per_env + extra_index
+
+    def get_extra_actor_row_indices(self, extra_index: int) -> torch.Tensor:
+        offset = self.get_extra_actor_offset(extra_index)
+        return self.get_actor_row_indices(offset)
+
+    def get_extra_actor_state_view(self, extra_index: int) -> torch.Tensor:
+        offset = self.get_extra_actor_offset(extra_index)
+        return self.all_root_states[:, offset]
+
+    def set_extra_actor_states(self, extra_index: int, env_ids, new_states: torch.Tensor = None):
+        if self.extra_actors_per_env <= 0:
+            raise RuntimeError("set_extra_actor_states called but no extra actors are configured")
+
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        elif not torch.is_tensor(env_ids):
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        if env_ids.numel() == 0:
+            return
+
+        offset = self.get_extra_actor_offset(extra_index)
+        if new_states is not None:
+            new_states = new_states.to(device=self.device)
+            self.all_root_states[env_ids, offset] = new_states
+
+        rows = self.get_actor_row_indices(offset).index_select(0, env_ids).contiguous()
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            self._root_state_ptr,
+            gymtorch.unwrap_tensor(rows),
+            rows.shape[0],
+        )
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+
     def update_markers(self, world_xyz: torch.Tensor):
         """
         world_xyz: [num_envs, num_markers, 3] 世界系坐标。
