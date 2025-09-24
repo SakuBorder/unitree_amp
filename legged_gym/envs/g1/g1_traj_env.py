@@ -5,7 +5,7 @@ from isaacgym.torch_utils import quat_rotate
 
 from phc.phc.utils import torch_utils
 
-from legged_gym.envs.g1.g1_env import G1Robot
+from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
 
 
 def _compute_location_observations(root_states: torch.Tensor, traj_samples: torch.Tensor) -> torch.Tensor:
@@ -30,7 +30,7 @@ def _compute_location_observations(root_states: torch.Tensor, traj_samples: torc
     return local_samples[..., 0:2].reshape(root_pos.shape[0], -1)
 
 
-class G1TrajRobot(G1Robot):
+class G1TrajRobot(G1AMPRobot):
 
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
@@ -106,6 +106,7 @@ class G1TrajRobot(G1Robot):
             self.obs_buf = torch.cat([self.obs_buf, traj_obs], dim=-1)
             if self.privileged_obs_buf is not None:
                 self.privileged_obs_buf = torch.cat([self.privileged_obs_buf, traj_obs], dim=-1)
+        self._refresh_observation_extras()
 
     def _reward_traj_tracking(self):
         dists = torch.norm(

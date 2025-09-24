@@ -4,7 +4,7 @@ from isaacgym.torch_utils import quat_mul, quat_rotate, quat_from_euler_xyz
 
 from phc.phc.utils import torch_utils
 
-from legged_gym.envs.g1.g1_env import G1Robot
+from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
 
 
 _BBOX_CORNERS = torch.tensor(
@@ -72,7 +72,7 @@ def _compute_sit_observations(
     )
 
 
-class G1SitRobot(G1Robot):
+class G1SitRobot(G1AMPRobot):
     """Unitree G1 坐下交互任务。"""
 
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
@@ -207,6 +207,7 @@ class G1SitRobot(G1Robot):
             self.obs_buf = torch.cat([self.obs_buf, task_obs], dim=-1)
             if self.privileged_obs_buf is not None:
                 self.privileged_obs_buf = torch.cat([self.privileged_obs_buf, task_obs], dim=-1)
+        self._refresh_observation_extras()
 
     def _compute_task_obs(self):
         base_obs = _compute_sit_observations(
