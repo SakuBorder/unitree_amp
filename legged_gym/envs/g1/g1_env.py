@@ -8,27 +8,42 @@ import torch
 class G1Robot(LeggedRobot):
     
     def _get_noise_scale_vec(self, cfg):
-        """ Sets a vector used to scale the noise added to the observations.
-            [NOTE]: Must be adapted when changing the observations structure
+        """Construct the proprioceptive noise scales used by this task."""
 
-        Args:
-            cfg (Dict): Environment config file
+        # The locomotion observations follow a fixed layout:
+        #   [ang vel(3), gravity(3), commands xyz(3), dof_pos(num_dof),
+        #    dof_vel(num_dof), actions(num_actions), sin_phase, cos_phase]
+        # Keep the noise vector aligned with this structure so that tasks
+        # extending the observation (e.g. carry/climb/sit/traj) can append
+        # extra features without having to mirror the noise settings.
+        proprio_dim = 3 + 3 + 3 + 2 * self.num_dof + self.num_actions + 2
 
-        Returns:
-            [torch.Tensor]: Vector of scales used to multiply a uniform distribution in [-1, 1]
-        """
-        noise_vec = torch.zeros_like(self.obs_buf[0])
+        noise_vec = self.obs_buf.new_zeros(proprio_dim)
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
         noise_level = self.cfg.noise.noise_level
-        noise_vec[:3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-        noise_vec[3:6] = noise_scales.gravity * noise_level
-        noise_vec[6:9] = 0. # commands
-        noise_vec[9:9+self.num_actions] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        noise_vec[9+self.num_actions:9+2*self.num_actions] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        noise_vec[9+2*self.num_actions:9+3*self.num_actions] = 0. # previous actions
-        noise_vec[9+3*self.num_actions:9+3*self.num_actions+2] = 0. # sin/cos phase
-        
+
+        idx = 0
+        noise_vec[idx : idx + 3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+        idx += 3
+        noise_vec[idx : idx + 3] = noise_scales.gravity * noise_level
+        idx += 3
+        # Commands (desired velocity) remain noise-free to keep goal signals
+        # stable. Reserve the slots explicitly to aid readability.
+        idx += 3
+
+        pos_end = idx + self.num_dof
+        noise_vec[idx:pos_end] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        idx = pos_end
+
+        vel_end = idx + self.num_dof
+        noise_vec[idx:vel_end] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+        idx = vel_end
+
+        # Previous actions and gait phase helpers are left noise-free.
+        idx += self.num_actions  # actions
+        idx += 2  # sin/cos phase
+
         return noise_vec
 
     def _init_foot(self):
