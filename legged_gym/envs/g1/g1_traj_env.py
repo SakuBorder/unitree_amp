@@ -1,13 +1,16 @@
+import os
 import numpy as np
 import torch
 from isaacgym import gymapi, gymtorch
-
-from TokenHSI.tokenhsi.utils import traj_generator
+from isaacgym.torch_utils import quat_rotate_inverse, torch_rand_float
+from legged_gym.utils.isaacgym_utils import get_euler_xyz as get_euler_xyz_in_tensor
+from TokenHSI.tokenhsi.utils import traj_generator, torch_utils
 from legged_gym.envs.g1.g1_amp_env import G1AMPRobot
+from legged_gym import LEGGED_GYM_ROOT_DIR
 
 
 class G1TrajRobot(G1AMPRobot):
-    """G1 task with trajectory following observations and rewards (HumanoidTraj-style markers & draw)."""
+    """G1 轨迹跟随任务（仅轨迹采样/观测/奖励；不创建 marker actor，支持线段调试绘制）。"""
 
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         # --- traj config ---
@@ -24,59 +27,51 @@ class G1TrajRobot(G1AMPRobot):
 
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
 
-        # cached samples (world/local) and time offsets
-        self._traj_samples_world = torch.zeros(self.num_envs, self._num_traj_samples, 3, device=self.device, dtype=torch.float32)
-        self._traj_samples_local = torch.zeros(self.num_envs, self._num_traj_samples, 2, device=self.device, dtype=torch.float32)
-        self._traj_sample_offsets = (torch.arange(self._num_traj_samples, device=self.device, dtype=torch.float32)
-                                     * self._traj_sample_timestep)
+        # 缓存的轨迹采样（world/local）与时间偏移
+        self._traj_samples_world = torch.zeros(
+            self.num_envs, self._num_traj_samples, 3, device=self.device, dtype=torch.float32
+        )
+        self._traj_samples_local = torch.zeros(
+            self.num_envs, self._num_traj_samples, 2, device=self.device, dtype=torch.float32
+        )
+        self._traj_sample_offsets = (
+            torch.arange(self._num_traj_samples, device=self.device, dtype=torch.float32) * self._traj_sample_timestep
+        )
 
-        # draw color (pure blue to match HumanoidTraj)
+        # 线段绘制颜色（可选 debug）
         self._traj_line_color = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
 
-        # build generator & prime buffers/extras
+        # 构建轨迹生成器并初始化缓冲
         self._build_traj_generator()
         self._refresh_traj_buffers()
         self._update_traj_extras()
 
-        # --- HumanoidTraj-style marker actors (red mini pillars) ---
-        self._traj_marker_asset = None
-        self._traj_marker_handles = []      # list[list[int]]
-        self._traj_marker_actor_ids = None  # Tensor[int32] in SIM domain
-        self._load_marker_asset()
-        self._create_marker_actors()
-        self._build_marker_actor_ids()
-        self._root_state_tensor = gymtorch.wrap_tensor(self.gym.acquire_actor_root_state_tensor(self.sim))
-
-
     # -------------------- reward cfg --------------------
     def _prepare_reward_function(self):
         super()._prepare_reward_function()
-        # 保持与 HumanoidTraj 等价的累计量级：此处不做 dt 缩放修正
 
     # -------------------- noise -------------------------
     def _get_noise_scale_vec(self, cfg):
-        base_noise = super()._get_noise_scale_vec(cfg)
-        base_obs_dim = cfg.env.num_observations - 2 * self._num_traj_samples
-        if base_obs_dim <= 0:
-            raise ValueError("Trajectory configuration must reserve space for proprioceptive observations.")
-        if base_noise.shape[-1] == base_obs_dim:
-            return base_noise
-        if base_noise.shape[-1] < base_obs_dim:
-            raise RuntimeError("Base observation noise vector is smaller than the proprioceptive observation width.")
-        return base_noise[..., :base_obs_dim].clone()
+        """
+        关键修复点：
+        返回“本体观测长度”的噪声向量，交由基类在 super().compute_observations() 阶段加噪。
+        轨迹拼接部分不加噪（与 HumanoidTraj 习惯一致）。
+        """
+        return super()._get_noise_scale_vec(cfg)
 
     # -------------------- resets ------------------------
     def reset_idx(self, env_ids):
         super().reset_idx(env_ids)
-        if env_ids.numel() > 0:
+        if torch.is_tensor(env_ids) and env_ids.numel() > 0:
             self._reset_traj_follow_task(env_ids)
             self._refresh_traj_buffers(env_ids)
             self._update_traj_extras()
-            self._update_markers_from_samples()  # keep markers in sync on reset
 
     # -------------------- observations ------------------
     def compute_observations(self):
+        # 先让基类生成本体观测并加噪
         super().compute_observations()
+        # 然后拼接轨迹局部坐标（每样本 2 维）
         _, traj_local = self._refresh_traj_buffers()
         traj_obs = traj_local.reshape(self.num_envs, -1)
         self.obs_buf = torch.cat((self.obs_buf, traj_obs), dim=-1)
@@ -90,9 +85,16 @@ class G1TrajRobot(G1AMPRobot):
     def _build_traj_generator(self):
         episode_dur = self.max_episode_length * self.dt
         self._traj_gen = traj_generator.TrajGenerator(
-            self.num_envs, episode_dur, self._traj_num_verts, self.device,
-            self._traj_dtheta_max, self._speed_min, self._speed_max,
-            self._accel_max, self._sharp_turn_prob, self._sharp_turn_angle
+            self.num_envs,
+            episode_dur,
+            self._traj_num_verts,
+            self.device,
+            self._traj_dtheta_max,
+            self._speed_min,
+            self._speed_max,
+            self._accel_max,
+            self._sharp_turn_prob,
+            self._sharp_turn_angle,
         )
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         root_pos = self.root_states[env_ids, 0:3]
@@ -151,79 +153,11 @@ class G1TrajRobot(G1AMPRobot):
         root_pos = self.root_states[:, 0:3]
         return compute_traj_reward(root_pos, traj_tar_pos)      # 固定系数 2.0，XY 误差
 
-    # -------------------- markers (HumanoidTraj style) --
-    def _load_marker_asset(self):
-        asset_root = "/home/dy/dy/code/unitree_amp/assert/"
-        asset_file = "location_marker.urdf"
-        opts = gymapi.AssetOptions()
-        opts.angular_damping = 0.01
-        opts.linear_damping = 0.01
-        opts.max_angular_velocity = 100.0
-        opts.density = 1.0
-        opts.fix_base_link = True
-        opts.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-        self._traj_marker_asset = self.gym.load_asset(self.sim, asset_root, asset_file, opts)
-
-    def _create_marker_actors(self):
-        default_pose = gymapi.Transform()
-        col_group = self.num_envs + 10
-        col_filter = 1
-        segmentation_id = 0
-        self._traj_marker_handles = []
-        for env_ptr in self.envs:
-            handles = []
-            for _ in range(self._num_traj_samples):
-                h = self.gym.create_actor(env_ptr, self._traj_marker_asset, default_pose,
-                                          "marker", col_group, col_filter, segmentation_id)
-                self.gym.set_actor_scale(env_ptr, h, 0.5)
-                self.gym.set_rigid_body_color(env_ptr, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
-                handles.append(h)
-            self._traj_marker_handles.append(handles)
-
-    def _build_marker_actor_ids(self):
-        ids = []
-        for env_idx, env_ptr in enumerate(self.envs):
-            for h in self._traj_marker_handles[env_idx]:
-                aid = self.gym.get_actor_index(env_ptr, h, gymapi.DOMAIN_SIM)  # ✅ (env, handle, domain)
-                ids.append(aid)
-        self._traj_marker_actor_ids = torch.tensor(ids, device=self.device, dtype=torch.int32)
-
-
-    def _update_markers_from_samples(self):
-        if self._traj_marker_actor_ids is None or self._traj_marker_actor_ids.numel() == 0:
-            return
-
-        # 读/写前刷新一次
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-
-        # 把采样点的 Z 提到当前根高（视觉一致）
-        z = self.root_states[:, 2:3]  # [N,1]
-        samples = self._traj_samples_world.clone()
-        samples[..., 2] = z.repeat(1, self._num_traj_samples)
-
-        idx = self._traj_marker_actor_ids.long()        # [N * num_traj_samples]
-        pos = samples.reshape(-1, 3)
-
-        # 写入“仿真级” root state buffer 对应行
-        self._root_state_tensor[idx, 0:3] = pos
-        self._root_state_tensor[idx, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
-        self._root_state_tensor[idx, 7:13] = 0.0
-
-        # 用 indexed 下发（指向同一块仿真 root state buffer）
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self._root_state_tensor),
-            gymtorch.unwrap_tensor(idx),
-            idx.shape[0],
-        )
-
-
-    # -------------------- rendering ---------------------
+    # -------------------- rendering（仅画线，完全不触碰 markers） ----
     def render(self, sync_frame_time=True):
         super().render(sync_frame_time)
         if self.viewer and self._traj_debug_enabled:
             self._refresh_traj_buffers()
-            self._update_markers_from_samples()
             self._draw_traj_debug()
 
     def _draw_traj_debug(self):
@@ -245,24 +179,22 @@ class G1TrajRobot(G1AMPRobot):
 def compute_location_observations(root_states, traj_samples):
     num_envs = root_states.shape[0]
     num_samples = traj_samples.shape[1] if traj_samples.dim() >= 2 else 0
-    if num_envs == 0:
+    if num_envs == 0 or num_samples == 0:
         return traj_samples.new_zeros((0, num_samples, 2))
 
     root_pos = root_states[:, 0:3]
     root_rot = root_states[:, 3:7]
+    heading_rot = torch_utils.calc_heading_quat_inv(root_rot)
 
-    sin_yaw = 2.0 * (root_rot[:, 3] * root_rot[:, 2] + root_rot[:, 0] * root_rot[:, 1])
-    cos_yaw = 1.0 - 2.0 * (root_rot[:, 1] * root_rot[:, 1] + root_rot[:, 2] * root_rot[:, 2])
-    heading = torch.atan2(sin_yaw, cos_yaw)
+    heading_rot_exp = torch.broadcast_to(heading_rot.unsqueeze(1), (num_envs, num_samples, 4))
+    root_pos_exp = torch.broadcast_to(root_pos.unsqueeze(1), (num_envs, num_samples, 3))
 
-    cos_h = torch.cos(heading).unsqueeze(1)
-    sin_h = torch.sin(heading).unsqueeze(1)
+    local_traj_samples = torch_utils.quat_rotate(
+        heading_rot_exp.reshape(-1, 4),
+        traj_samples.reshape(-1, 3) - root_pos_exp.reshape(-1, 3)
+    )
 
-    delta = traj_samples[..., 0:2] - root_pos.unsqueeze(1)[..., 0:2]
-    x_local = cos_h * delta[..., 0] + sin_h * delta[..., 1]
-    y_local = -sin_h * delta[..., 0] + cos_h * delta[..., 1]
-
-    return torch.stack((x_local, y_local), dim=-1)
+    return local_traj_samples[..., 0:2].reshape(num_envs, num_samples, 2)
 
 
 @torch.jit.script
