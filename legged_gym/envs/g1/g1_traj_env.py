@@ -32,6 +32,23 @@ def _compute_location_observations(root_states: torch.Tensor, traj_samples: torc
 
 class G1TrajRobot(G1AMPRobot):
 
+    def _get_noise_scale_vec(self, cfg):
+        base_vec = super()._get_noise_scale_vec(cfg)
+
+        if not getattr(cfg.env, "enableTaskObs", False):
+            return base_vec
+
+        num_samples = min(
+            cfg.traj.num_samples,
+            getattr(cfg.traj, "num_obs_samples", cfg.traj.num_samples),
+        )
+        extra_dim = 2 * max(int(num_samples), 0)
+        if extra_dim <= 0:
+            return base_vec
+
+        padding = base_vec.new_zeros(extra_dim)
+        return torch.cat([base_vec, padding], dim=0)
+
     def __init__(self, cfg, sim_params, physics_engine, sim_device, headless):
         super().__init__(cfg, sim_params, physics_engine, sim_device, headless)
         self._init_trajectory_buffers()
