@@ -5,8 +5,8 @@ class G1CarryCfg(G1RoughCfg):
     """G1搬运任务配置"""
     
     class env(G1RoughCfg.env):
-        num_observations = 47 + 30  # 基础观测 + 任务观测
-        num_privileged_obs = 50 + 30
+        num_observations = 47 + 42  # 基础观测 + 任务观测
+        num_privileged_obs = 50 + 42
         enableTaskObs = True
         onlyVelReward = False
         onlyHeightHandHeldReward = False

@@ -1,10 +1,75 @@
 import torch
 from isaacgym import gymapi
-from isaacgym.torch_utils import *
+from isaacgym.torch_utils import quat_mul, quat_rotate, quat_from_euler_xyz
 
 from phc.phc.utils import torch_utils
 
 from legged_gym.envs.g1.g1_env import G1Robot
+
+
+_BBOX_CORNERS = torch.tensor(
+    [
+        [-1.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ],
+    dtype=torch.float32,
+)
+
+
+def _compute_sit_observations(
+    root_states: torch.Tensor,
+    tar_pos: torch.Tensor,
+    object_states: torch.Tensor,
+    object_bps: torch.Tensor,
+    object_facings: torch.Tensor,
+) -> torch.Tensor:
+    root_pos = root_states[:, 0:3]
+    root_rot = root_states[:, 3:7]
+    heading_rot = torch_utils.calc_heading_quat_inv(root_rot)
+
+    local_tar_pos = quat_rotate(heading_rot, tar_pos - root_pos)
+
+    obj_pos = object_states[:, 0:3]
+    obj_rot = object_states[:, 3:7]
+
+    local_object_pos = quat_rotate(heading_rot, obj_pos - root_pos)
+    local_object_rot = quat_mul(heading_rot, obj_rot)
+    local_object_rot_obs = torch_utils.quat_to_tan_norm(local_object_rot)
+
+    obj_pos_exp = obj_pos.unsqueeze(1).expand_as(object_bps)
+    obj_rot_exp = obj_rot.unsqueeze(1).expand_as(obj_pos_exp)
+    root_pos_exp = root_pos.unsqueeze(1).expand_as(object_bps)
+    heading_rot_exp = heading_rot.unsqueeze(1).expand_as(object_bps)
+
+    obj_bps_world = quat_rotate(
+        obj_rot_exp.reshape(-1, 4),
+        object_bps.reshape(-1, 3),
+    ).reshape_as(object_bps) + obj_pos_exp
+
+    obj_bps_local = quat_rotate(
+        heading_rot_exp.reshape(-1, 4),
+        (obj_bps_world - root_pos_exp).reshape(-1, 3),
+    ).reshape(root_pos.shape[0], -1)
+
+    face_vec_world = quat_rotate(obj_rot, object_facings)
+    face_vec_local = quat_rotate(heading_rot, face_vec_world)[..., 0:2]
+
+    return torch.cat(
+        [
+            local_tar_pos,
+            obj_bps_local,
+            face_vec_local,
+            local_object_pos,
+            local_object_rot_obs,
+        ],
+        dim=-1,
+    )
 
 
 class G1SitRobot(G1Robot):
@@ -120,10 +185,12 @@ class G1SitRobot(G1Robot):
             cfg if cfg is not None else self.seat_configs[0]
             for cfg in self._env_seat_configs
         ]
-        self.seat_heights = torch.tensor([cfg["seat_height"] for cfg in configs], device=self.device)
-        self.seat_bbox = torch.tensor([cfg["bbox"] for cfg in configs], device=self.device)
-        self.seat_facing = torch.tensor([cfg["facing"] for cfg in configs], device=self.device)
-        self.seat_sit_offset = torch.tensor([cfg["sit_offset"] for cfg in configs], device=self.device)
+        self.seat_heights = torch.tensor([cfg["seat_height"] for cfg in configs], device=self.device, dtype=torch.float32)
+        self.seat_bbox = torch.tensor([cfg["bbox"] for cfg in configs], device=self.device, dtype=torch.float32)
+        self.seat_facing = torch.tensor([cfg["facing"] for cfg in configs], device=self.device, dtype=torch.float32)
+        self.seat_sit_offset = torch.tensor([cfg["sit_offset"] for cfg in configs], device=self.device, dtype=torch.float32)
+        self._bbox_corners = _BBOX_CORNERS.to(self.device)
+        self.seat_bps = 0.5 * self.seat_bbox.unsqueeze(1) * self._bbox_corners.unsqueeze(0)
 
         self.sit_target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.sit_target_orient = torch.zeros(self.num_envs, 4, device=self.device)
@@ -142,63 +209,14 @@ class G1SitRobot(G1Robot):
                 self.privileged_obs_buf = torch.cat([self.privileged_obs_buf, task_obs], dim=-1)
 
     def _compute_task_obs(self):
-        rel_seat_pos = self.seat_pos - self.base_pos
-        rel_sit_target = self.sit_target_pos - self.base_pos
-
-        heading_rot = torch_utils.calc_heading_quat_inv(self.base_quat)
-        local_seat_pos = quat_rotate(heading_rot, rel_seat_pos)
-        local_sit_target = quat_rotate(heading_rot, rel_sit_target)
-
-        local_seat_rot = quat_mul(heading_rot, self.seat_rot)
-        seat_rot_obs = torch_utils.quat_to_tan_norm(local_seat_rot)
-
-        seat_facing_world = quat_rotate(self.seat_rot, self.seat_facing)
-        local_seat_facing = quat_rotate(heading_rot, seat_facing_world)
-
-        bbox_points = self._compute_seat_bbox_points()
-        local_bbox = self._transform_to_local(bbox_points, heading_rot)
-
-        task_obs = torch.cat([
-            local_sit_target,
-            local_seat_pos,
-            seat_rot_obs,
-            local_seat_facing[:, :2],
-            local_bbox.reshape(self.num_envs, -1)[:, :24],
-            self.sit_stability_buf.unsqueeze(-1),
-        ], dim=-1)
-        return task_obs
-
-    def _compute_seat_bbox_points(self):
-        half_size = self.seat_bbox / 2.0
-        corners = torch.tensor(
-            [
-                [-1, -1, -1],
-                [1, -1, -1],
-                [1, 1, -1],
-                [-1, 1, -1],
-                [-1, -1, 1],
-                [1, -1, 1],
-                [1, 1, 1],
-                [-1, 1, 1],
-            ],
-            device=self.device,
-            dtype=torch.float32,
+        base_obs = _compute_sit_observations(
+            self.root_states,
+            self.sit_target_pos,
+            self.seat_states,
+            self.seat_bps,
+            self.seat_facing,
         )
-        corners = corners.unsqueeze(0) * half_size.unsqueeze(1)
-        seat_rot = self.seat_rot.unsqueeze(1).expand(-1, 8, -1)
-        world_corners = quat_rotate(seat_rot.reshape(-1, 4), corners.reshape(-1, 3))
-        world_corners = world_corners.reshape(self.num_envs, 8, 3)
-        world_corners += self.seat_pos.unsqueeze(1)
-        return world_corners
-
-    def _transform_to_local(self, points, heading_rot):
-        rel_points = points - self.base_pos.unsqueeze(1)
-        heading_rot_expanded = heading_rot.unsqueeze(1).expand(-1, points.shape[1], -1)
-        local_points = quat_rotate(
-            heading_rot_expanded.reshape(-1, 4),
-            rel_points.reshape(-1, 3),
-        )
-        return local_points.reshape(self.num_envs, -1, 3)
+        return torch.cat([base_obs, self.sit_stability_buf.unsqueeze(-1)], dim=-1)
 
     # ------------------------------------------------------------------
     # 状态更新/重置
@@ -220,12 +238,14 @@ class G1SitRobot(G1Robot):
         seat_height = self.seat_heights[env_ids]
 
         # 随机化座椅的位置和朝向
-        self.seat_states[env_ids, 0] = torch_rand_float(0.8, 1.5, (env_ids.numel(),), device=self.device)
-        self.seat_states[env_ids, 1] = torch_rand_float(-0.4, 0.4, (env_ids.numel(),), device=self.device)
+        self.seat_states[env_ids, 0] = torch.rand(env_ids.numel(), device=self.device) * 0.7 + 0.8
+        self.seat_states[env_ids, 1] = torch.rand(env_ids.numel(), device=self.device) * 0.8 - 0.4
         self.seat_states[env_ids, 2] = seat_height / 2.0
 
-        yaw = torch_rand_float(-0.5, 0.5, (env_ids.numel(),), device=self.device)
-        quat = quat_from_euler_xyz(torch.zeros_like(yaw), torch.zeros_like(yaw), yaw)
+        yaw = torch.rand(env_ids.numel(), device=self.device) - 0.5
+        quat = quat_from_euler_xyz(
+            torch.zeros_like(yaw), torch.zeros_like(yaw), yaw
+        )
         self.seat_states[env_ids, 3:7] = quat
         self.seat_states[env_ids, 7:13] = 0.0
 

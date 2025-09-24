@@ -1,11 +1,33 @@
 import math
 
 import torch
-from isaacgym.torch_utils import torch_rand_float
+from isaacgym.torch_utils import quat_rotate
 
 from phc.phc.utils import torch_utils
 
 from legged_gym.envs.g1.g1_env import G1Robot
+
+
+def _compute_location_observations(root_states: torch.Tensor, traj_samples: torch.Tensor) -> torch.Tensor:
+    """Replicates TokenHSI's trajectory observation builder.
+
+    The samples are expressed in the world frame. This function projects the
+    XY offsets into the robot heading frame and flattens them.
+    """
+
+    root_pos = root_states[:, 0:3]
+    root_rot = root_states[:, 3:7]
+    heading_rot = torch_utils.calc_heading_quat_inv(root_rot)
+
+    heading_rot_exp = heading_rot.unsqueeze(1).expand(-1, traj_samples.shape[1], -1)
+    root_pos_exp = root_pos.unsqueeze(1).expand_as(traj_samples)
+
+    local_samples = quat_rotate(
+        heading_rot_exp.reshape(-1, 4),
+        (traj_samples.reshape(-1, 3) - root_pos_exp.reshape(-1, 3)),
+    ).reshape(root_pos.shape[0], traj_samples.shape[1], 3)
+
+    return local_samples[..., 0:2].reshape(root_pos.shape[0], -1)
 
 
 class G1TrajRobot(G1Robot):
@@ -49,23 +71,25 @@ class G1TrajRobot(G1Robot):
             points = self.traj_points[env_id]
             dirs = self.traj_dirs[env_id]
 
-            heading = torch_rand_float(-math.pi, math.pi, (1,), device=self.device)[0]
-            speed = torch_rand_float(speed_min, speed_max, (1,), device=self.device)[0]
+            heading = float((torch.rand(1, device=self.device) * 2.0 - 1.0) * math.pi)
+            speed = float(torch.rand(1, device=self.device) * (speed_max - speed_min) + speed_min)
 
             points[0, 0:2] = start_pos
             points[0, 2] = self.cfg.rewards.base_height_target
-            dirs[0] = torch.tensor([math.cos(heading), math.sin(heading)], device=self.device)
+            dirs[0] = torch.tensor([math.cos(heading), math.sin(heading)], device=self.device, dtype=torch.float32)
 
             for idx in range(1, self.cfg.traj.num_samples):
-                if torch.rand(1, device=self.device) < sharp_turn_prob:
-                    heading += torch_rand_float(-sharp_turn_angle, sharp_turn_angle, (1,), device=self.device)[0]
+                delta_heading = float(torch.rand(1, device=self.device))
+                if delta_heading < sharp_turn_prob:
+                    delta_heading = float((torch.rand(1, device=self.device) * 2.0 - 1.0) * sharp_turn_angle)
                 else:
-                    heading += torch_rand_float(-0.25, 0.25, (1,), device=self.device)[0]
+                    delta_heading = float((torch.rand(1, device=self.device) * 0.5 - 0.25))
+                heading += delta_heading
 
-                speed_delta = torch_rand_float(-accel_max, accel_max, (1,), device=self.device)[0] * dt
-                speed = torch.clamp(speed + speed_delta, speed_min, speed_max)
+                speed_delta = float((torch.rand(1, device=self.device) * 2.0 - 1.0) * accel_max * dt)
+                speed = max(min(speed + speed_delta, speed_max), speed_min)
 
-                dirs[idx] = torch.tensor([math.cos(heading), math.sin(heading)], device=self.device)
+                dirs[idx] = torch.tensor([math.cos(heading), math.sin(heading)], device=self.device, dtype=torch.float32)
                 step = dirs[idx] * speed * dt
                 points[idx, 0:2] = points[idx - 1, 0:2] + step
                 points[idx, 2] = self.cfg.rewards.base_height_target
@@ -76,9 +100,9 @@ class G1TrajRobot(G1Robot):
     def compute_observations(self):
         super().compute_observations()
         if self.cfg.env.enableTaskObs:
-            rel_traj = self.traj_points - self.base_pos.unsqueeze(1)
-            num_samples = min(5, self.cfg.traj.num_samples)
-            traj_obs = rel_traj[:, :num_samples].reshape(self.num_envs, -1)
+            num_samples = min(self.cfg.traj.num_samples, getattr(self.cfg.traj, "num_obs_samples", self.cfg.traj.num_samples))
+            traj_samples = self.traj_points[:, :num_samples]
+            traj_obs = _compute_location_observations(self.root_states, traj_samples)
             self.obs_buf = torch.cat([self.obs_buf, traj_obs], dim=-1)
             if self.privileged_obs_buf is not None:
                 self.privileged_obs_buf = torch.cat([self.privileged_obs_buf, traj_obs], dim=-1)

@@ -1,8 +1,86 @@
 import torch
 from isaacgym import gymapi
-from isaacgym.torch_utils import torch_rand_float
+from isaacgym.torch_utils import quat_mul, quat_rotate
+
+from phc.phc.utils import torch_utils
 
 from legged_gym.envs.g1.g1_env import G1Robot
+
+
+_BBOX_CORNERS = torch.tensor(
+    [
+        [-1.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ],
+    dtype=torch.float32,
+)
+
+
+def _compute_carry_observations(
+    root_states: torch.Tensor,
+    box_states: torch.Tensor,
+    box_bps: torch.Tensor,
+    tar_pos: torch.Tensor,
+    enable_bbox_obs: bool,
+) -> torch.Tensor:
+    """Builds carry observations following TokenHSI's formulation."""
+
+    root_pos = root_states[:, 0:3]
+    root_rot = root_states[:, 3:7]
+    heading_rot = torch_utils.calc_heading_quat_inv(root_rot)
+
+    box_pos = box_states[:, 0:3]
+    box_rot = box_states[:, 3:7]
+    box_vel = box_states[:, 7:10]
+    box_ang_vel = box_states[:, 10:13]
+
+    local_box_pos = quat_rotate(heading_rot, box_pos - root_pos)
+    local_box_rot = quat_mul(heading_rot, box_rot)
+    local_box_rot_obs = torch_utils.quat_to_tan_norm(local_box_rot)
+    local_box_vel = quat_rotate(heading_rot, box_vel)
+    local_box_ang_vel = quat_rotate(heading_rot, box_ang_vel)
+
+    heading_rot_exp = heading_rot.unsqueeze(1).expand_as(box_bps)
+    root_pos_exp = root_pos.unsqueeze(1).expand_as(box_bps)
+    box_pos_exp = box_pos.unsqueeze(1).expand_as(box_bps)
+    box_rot_exp = box_rot.unsqueeze(1).expand_as(heading_rot_exp)
+
+    box_bps_world = quat_rotate(
+        box_rot_exp.reshape(-1, 4),
+        box_bps.reshape(-1, 3),
+    ).reshape_as(box_bps) + box_pos_exp
+
+    box_bps_local = quat_rotate(
+        heading_rot_exp.reshape(-1, 4),
+        (box_bps_world - root_pos_exp).reshape(-1, 3),
+    ).reshape(root_pos.shape[0], -1)
+
+    local_tar_pos = quat_rotate(heading_rot, tar_pos - root_pos)
+
+    if enable_bbox_obs:
+        obs_parts = [
+            local_box_vel,
+            local_box_ang_vel,
+            local_box_pos,
+            local_box_rot_obs,
+            box_bps_local,
+            local_tar_pos,
+        ]
+    else:
+        obs_parts = [
+            local_box_vel,
+            local_box_ang_vel,
+            local_box_pos,
+            local_box_rot_obs,
+            local_tar_pos,
+        ]
+    return torch.cat(obs_parts, dim=-1)
 
 
 class G1CarryRobot(G1Robot):
@@ -64,6 +142,7 @@ class G1CarryRobot(G1Robot):
         self.box_pos = self.box_states[:, 0:3]
         self.box_rot = self.box_states[:, 3:7]
         self.box_vel = self.box_states[:, 7:10]
+        self.box_ang_vel = self.box_states[:, 10:13]
 
         # 目标位置/缓存
         self.tar_pos = torch.zeros(self.num_envs, 3, device=self.device)
@@ -71,6 +150,11 @@ class G1CarryRobot(G1Robot):
 
         # "手" 的 proxy 索引（用脚部代替）
         self.hand_indices = [5, 11]
+
+        base_size = torch.tensor(self.cfg.box.build.baseSize, device=self.device, dtype=torch.float32)
+        self.box_size = base_size.unsqueeze(0).expand(self.num_envs, -1).clone()
+        self._bbox_corners = _BBOX_CORNERS.to(self.device)
+        self.box_bps = 0.5 * self.box_size.unsqueeze(1) * self._bbox_corners.unsqueeze(0)
 
         # 初始化所有环境的箱子状态
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
@@ -88,20 +172,14 @@ class G1CarryRobot(G1Robot):
                 self.privileged_obs_buf = torch.cat([self.privileged_obs_buf, task_obs], dim=-1)
 
     def _compute_task_obs(self):
-        rel_box_pos = self.box_pos - self.base_pos
-        rel_tar_pos = self.tar_pos - self.base_pos
-
-        box_rot_obs = torch.cat([
-            self.box_rot[:, -1:].contiguous(),  # w
-            self.box_rot[:, :3].contiguous(),
-        ], dim=-1)
-
-        return torch.cat([
-            rel_tar_pos,
-            rel_box_pos,
-            box_rot_obs,
-            self.box_vel,
-        ], dim=-1)
+        enable_bbox = getattr(self.cfg.box.obs, "enableBboxObs", False)
+        return _compute_carry_observations(
+            self.root_states,
+            self.box_states,
+            self.box_bps,
+            self.tar_pos,
+            enable_bbox,
+        )
 
     def _reward_carry_walk(self):
         dist = torch.norm(self.box_pos[:, :2] - self.base_pos[:, :2], dim=-1)
@@ -144,16 +222,21 @@ class G1CarryRobot(G1Robot):
         height = float(self.cfg.box.build.baseSize[2])
 
         # 随机起始位置/姿态
-        self.box_states[env_ids, 0:2] = torch_rand_float(-0.6, 0.6, (env_ids.numel(), 2), device=self.device)
+        self.box_states[env_ids, 0] = torch.rand(env_ids.numel(), device=self.device) * 1.2 - 0.6
+        self.box_states[env_ids, 1] = torch.rand(env_ids.numel(), device=self.device) * 1.2 - 0.6
         self.box_states[env_ids, 2] = height / 2.0
-        self.box_states[env_ids, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        self.box_states[env_ids, 3:7] = self.box_states.new_tensor((0.0, 0.0, 0.0, 1.0))
         self.box_states[env_ids, 7:13] = 0.0
 
         # 随机目标位置
-        self.tar_pos[env_ids, 0:2] = torch_rand_float(-2.0, 2.0, (env_ids.numel(), 2), device=self.device)
+        self.tar_pos[env_ids, 0] = torch.rand(env_ids.numel(), device=self.device) * 4.0 - 2.0
+        self.tar_pos[env_ids, 1] = torch.rand(env_ids.numel(), device=self.device) * 4.0 - 2.0
         self.tar_pos[env_ids, 2] = height / 2.0
 
         self.prev_box_pos[env_ids] = self.box_pos[env_ids]
+
+        # 更新 bbox 点
+        self.box_bps[env_ids] = 0.5 * self.box_size[env_ids].unsqueeze(1) * self._bbox_corners.unsqueeze(0)
 
         # 写回仿真
         self.set_extra_actor_states(0, env_ids)

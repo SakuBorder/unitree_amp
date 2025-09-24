@@ -4,7 +4,8 @@ class G1SitCfg(G1RoughCfg):
     """G1坐下任务配置"""
     
     class env(G1RoughCfg.env):
-        num_observations = 47 + 37  # 基础 + 任务观测
+        num_observations = 47 + 39  # 基础 + 任务观测
+        num_privileged_obs = 50 + 39
         enableTaskObs = True
         enableConditionalDisc = False
         

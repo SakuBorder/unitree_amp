@@ -1,10 +1,58 @@
 import torch
 from isaacgym import gymapi
-from isaacgym.torch_utils import *
+from isaacgym.torch_utils import quat_rotate
 
 from phc.phc.utils import torch_utils
 
 from legged_gym.envs.g1.g1_env import G1Robot
+
+
+_BBOX_CORNERS = torch.tensor(
+    [
+        [-1.0, -1.0, -1.0],
+        [1.0, -1.0, -1.0],
+        [1.0, 1.0, -1.0],
+        [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0],
+        [1.0, -1.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+    ],
+    dtype=torch.float32,
+)
+
+
+def _compute_climb_observations(
+    root_states: torch.Tensor,
+    climb_object_states: torch.Tensor,
+    climb_object_bps: torch.Tensor,
+    climb_tar_pos: torch.Tensor,
+) -> torch.Tensor:
+    root_pos = root_states[:, 0:3]
+    root_rot = root_states[:, 3:7]
+    heading_rot = torch_utils.calc_heading_quat_inv(root_rot)
+
+    heading_rot_exp = heading_rot.unsqueeze(1).expand_as(climb_object_bps)
+    root_pos_exp = root_pos.unsqueeze(1).expand_as(climb_object_bps)
+
+    obj_pos = climb_object_states[:, 0:3]
+    obj_rot = climb_object_states[:, 3:7]
+    obj_pos_exp = obj_pos.unsqueeze(1).expand_as(climb_object_bps)
+    obj_rot_exp = obj_rot.unsqueeze(1).expand_as(heading_rot_exp)
+
+    obj_bps_world = quat_rotate(
+        obj_rot_exp.reshape(-1, 4),
+        climb_object_bps.reshape(-1, 3),
+    ).reshape_as(climb_object_bps) + obj_pos_exp
+
+    obj_bps_local = quat_rotate(
+        heading_rot_exp.reshape(-1, 4),
+        (obj_bps_world - root_pos_exp).reshape(-1, 3),
+    ).reshape(root_pos.shape[0], -1)
+
+    local_climb_tar = quat_rotate(heading_rot, climb_tar_pos - root_pos)
+
+    return torch.cat([local_climb_tar, obj_bps_local], dim=-1)
 
 
 class G1ClimbRobot(G1Robot):
@@ -102,6 +150,8 @@ class G1ClimbRobot(G1Robot):
         self.climb_object_bbox = torch.stack(
             [bbox.to(self.device) for bbox in self._env_climb_bbox], dim=0
         )
+        self._bbox_corners = _BBOX_CORNERS.to(self.device)
+        self.climb_object_bps = 0.5 * self.climb_object_bbox.unsqueeze(1) * self._bbox_corners.unsqueeze(0)
 
         self.climb_target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self.climb_progress = torch.zeros(self.num_envs, device=self.device)
@@ -123,56 +173,12 @@ class G1ClimbRobot(G1Robot):
                 self.privileged_obs_buf = torch.cat([self.privileged_obs_buf, task_obs], dim=-1)
 
     def _compute_task_obs(self):
-        rel_object_pos = self.climb_object_pos - self.base_pos
-        rel_target_pos = self.climb_target_pos - self.base_pos
-
-        heading_rot = torch_utils.calc_heading_quat_inv(self.base_quat)
-        local_object_pos = quat_rotate(heading_rot, rel_object_pos)
-        local_target_pos = quat_rotate(heading_rot, rel_target_pos)
-
-        bbox_points = self._compute_bbox_points()
-        local_bbox_points = self._transform_bbox_to_local(bbox_points, heading_rot)
-
-        task_obs = torch.cat([
-            local_target_pos,
-            local_object_pos,
-            self.climb_object_rot,
-            local_bbox_points.reshape(self.num_envs, -1)[:, :24],
-        ], dim=-1)
-        return task_obs
-
-    def _compute_bbox_points(self):
-        half_size = self.climb_object_bbox / 2.0
-        corners = torch.tensor(
-            [
-                [-1, -1, -1],
-                [1, -1, -1],
-                [1, 1, -1],
-                [-1, 1, -1],
-                [-1, -1, 1],
-                [1, -1, 1],
-                [1, 1, 1],
-                [-1, 1, 1],
-            ],
-            device=self.device,
-            dtype=torch.float32,
+        return _compute_climb_observations(
+            self.root_states,
+            self.climb_object_states,
+            self.climb_object_bps,
+            self.climb_target_pos,
         )
-        corners = corners.unsqueeze(0) * half_size.unsqueeze(1)
-
-        rot = self.climb_object_rot.unsqueeze(1).expand(-1, 8, -1)
-        world_corners = quat_rotate(rot.reshape(-1, 4), corners.reshape(-1, 3))
-        world_corners = world_corners.reshape(self.num_envs, 8, 3)
-        world_corners += self.climb_object_pos.unsqueeze(1)
-        return world_corners
-
-    def _transform_bbox_to_local(self, bbox_points, heading_rot):
-        rel_points = bbox_points - self.base_pos.unsqueeze(1)
-        heading_exp = heading_rot.unsqueeze(1).expand(-1, bbox_points.shape[1], -1)
-        local_points = quat_rotate(
-            heading_exp.reshape(-1, 4),
-            rel_points.reshape(-1, 3),
-        )
-        return local_points.reshape(self.num_envs, -1, 3)
 
     # ------------------------------------------------------------------
     # 状态更新/重置
@@ -191,10 +197,10 @@ class G1ClimbRobot(G1Robot):
         if env_ids.numel() == 0:
             return
 
-        self.climb_object_states[env_ids, 0] = torch_rand_float(1.5, 3.0, (env_ids.numel(),), device=self.device)
-        self.climb_object_states[env_ids, 1] = torch_rand_float(-0.5, 0.5, (env_ids.numel(),), device=self.device)
+        self.climb_object_states[env_ids, 0] = torch.rand(env_ids.numel(), device=self.device) * 1.5 + 1.5
+        self.climb_object_states[env_ids, 1] = torch.rand(env_ids.numel(), device=self.device) - 0.5
         self.climb_object_states[env_ids, 2] = 0.0
-        self.climb_object_states[env_ids, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        self.climb_object_states[env_ids, 3:7] = self.climb_object_states.new_tensor((0.0, 0.0, 0.0, 1.0))
         self.climb_object_states[env_ids, 7:13] = 0.0
 
         bbox = self.climb_object_bbox[env_ids]

@@ -5,6 +5,7 @@ class G1TrajCfg(G1RoughCfg):
     
     class env(G1RoughCfg.env):
         num_observations = 47 + 20  # 基础 + 轨迹点
+        num_privileged_obs = 50 + 20
         enableTaskObs = True
         
     class traj:

@@ -5,6 +5,7 @@ class G1ClimbCfg(G1RoughCfg):
     
     class env(G1RoughCfg.env):
         num_observations = 47 + 27  # 基础 + 任务观测
+        num_privileged_obs = 50 + 27
         enableTaskObs = True
         
         climb_vel_penalty = True
