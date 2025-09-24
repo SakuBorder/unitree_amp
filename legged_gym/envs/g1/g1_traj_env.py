@@ -52,12 +52,43 @@ class G1TrajRobot(G1AMPRobot):
 
     # -------------------- noise -------------------------
     def _get_noise_scale_vec(self, cfg):
+        """Return a noise vector that only spans the proprioceptive observations.
+
+        ``LeggedRobot`` expects ``self.noise_scale_vec`` to match the width of the
+        observation tensor that is assembled inside ``G1Robot.compute_observations``.
+        For the trajectory task we append additional features *after* that base call,
+        so only the proprioceptive slice should receive stochastic perturbations.
+
+        If we were to return the full trajectory-extended length here (as the parent
+        implementation does by default) the later noise application would attempt to
+        add tensors of mismatched widths, triggering the runtime error observed
+        during initialisation.
         """
-        关键修复点：
-        返回“本体观测长度”的噪声向量，交由基类在 super().compute_observations() 阶段加噪。
-        轨迹拼接部分不加噪（与 HumanoidTraj 习惯一致）。
-        """
-        return super()._get_noise_scale_vec(cfg)
+
+        base_noise = super()._get_noise_scale_vec(cfg)
+
+        # ``G1Robot`` exposes the following proprioceptive layout (in order):
+        #   3x base angular velocity
+        #   3x projected gravity
+        #   3x commanded velocity
+        #   3 * num_actions joint features (position, velocity, previous action)
+        #   2x phase (sin, cos)
+        proprio_obs_dim = 9 + 3 * self.num_actions + 2
+        traj_obs_dim = 2 * cfg.traj.num_samples
+        total_obs_dim = base_noise.shape[-1]
+
+        if proprio_obs_dim <= 0:
+            raise ValueError("Trajectory task requires a positive proprioceptive observation width.")
+        if total_obs_dim < proprio_obs_dim:
+            raise RuntimeError(
+                "Noise vector shorter than proprioceptive observation width; check base observation setup."
+            )
+        if total_obs_dim < proprio_obs_dim + traj_obs_dim:
+            raise RuntimeError(
+                "Configured trajectory observations exceed total observation width; update cfg.env.num_observations."
+            )
+
+        return base_noise[..., :proprio_obs_dim].clone()
 
     # -------------------- resets ------------------------
     def reset_idx(self, env_ids):
