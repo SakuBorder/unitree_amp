@@ -66,16 +66,29 @@ class G1TrajRobot(G1AMPRobot):
         """
 
         base_noise = super()._get_noise_scale_vec(cfg)
-        base_obs_dim = cfg.env.num_observations - 2 * cfg.traj.num_samples
-        if base_obs_dim <= 0:
-            raise ValueError(
-                "Trajectory task must reserve proprioceptive observations before task features."
-            )
-        if base_noise.shape[-1] < base_obs_dim:
+
+        # ``G1Robot`` exposes the following proprioceptive layout (in order):
+        #   3x base angular velocity
+        #   3x projected gravity
+        #   3x commanded velocity
+        #   3 * num_actions joint features (position, velocity, previous action)
+        #   2x phase (sin, cos)
+        proprio_obs_dim = 9 + 3 * self.num_actions + 2
+        traj_obs_dim = 2 * cfg.traj.num_samples
+        total_obs_dim = base_noise.shape[-1]
+
+        if proprio_obs_dim <= 0:
+            raise ValueError("Trajectory task requires a positive proprioceptive observation width.")
+        if total_obs_dim < proprio_obs_dim:
             raise RuntimeError(
-                "Base noise vector shorter than proprioceptive observation width."
+                "Noise vector shorter than proprioceptive observation width; check base observation setup."
             )
-        return base_noise[..., :base_obs_dim].clone()
+        if total_obs_dim < proprio_obs_dim + traj_obs_dim:
+            raise RuntimeError(
+                "Configured trajectory observations exceed total observation width; update cfg.env.num_observations."
+            )
+
+        return base_noise[..., :proprio_obs_dim].clone()
 
     # -------------------- resets ------------------------
     def reset_idx(self, env_ids):
