@@ -30,9 +30,18 @@ class LeggedRobot(BaseTask):
         self.enable_markers: bool = bool(getattr(self.cfg, "traj", None) and getattr(self.cfg.traj, "enable_markers", False))
         self.num_markers: int = int(getattr(self.cfg.traj, "num_samples", 0) if self.enable_markers else 0)
 
+        # ===== 额外 actor 管理 =====
+        # 子类（如携带、攀爬、坐下任务）可在 super().__init__ 之前设置 extra_actors_per_env。
+        # 这里读取并规范化该属性，确保 LeggedRobot 统一维护 actors_per_env。
+        self.extra_actors_per_env: int = int(getattr(self, "extra_actors_per_env", 0))
+
         # 必须在 create_sim 前确定 actors_per_env
-        self.actors_per_env = 1 + (self.num_markers if self.enable_markers else 0)
-        print(f"[LeggedRobot] actors_per_env={self.actors_per_env} (markers enabled={self.enable_markers}, count={self.num_markers})")
+        base_actors = 1 + (self.num_markers if self.enable_markers else 0)
+        self.actors_per_env = base_actors + self.extra_actors_per_env
+        print(
+            "[LeggedRobot] actors_per_env="
+            f"{self.actors_per_env} (markers={self.num_markers}, extra={self.extra_actors_per_env})"
+        )
 
         # 这些在 _create_envs/_init_buffers 中赋值
         self.marker_asset = None
@@ -45,6 +54,7 @@ class LeggedRobot(BaseTask):
         self.marker_pos = None            # view [E, M, 3]
         self.robot_actor_ids = []         # (num_envs,) SIM 行号
         self.robot_rows = None            # torch int32 (num_envs,)
+        self._actor_row_base = None       # base rows for each env (int32)
 
         self._parse_cfg(self.cfg)
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
@@ -372,6 +382,11 @@ class LeggedRobot(BaseTask):
         else:
             self.robot_rows = (torch.arange(self.num_envs, device=device, dtype=torch.int32) * self.actors_per_env)
 
+        # 每个环境在 root tensor 中的起始行号。
+        self._actor_row_base = torch.arange(
+            self.num_envs, device=device, dtype=torch.int32
+        ) * self.actors_per_env
+
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
@@ -663,6 +678,67 @@ class LeggedRobot(BaseTask):
 
     def _reward_feet_contact_forces(self):
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
+
+    # ======================== 额外 actor 工具 ========================
+    def _ensure_actor_row_base(self):
+        if self._actor_row_base is None or self._actor_row_base.shape[0] != self.num_envs:
+            device = self.device if hasattr(self, "device") else "cpu"
+            self._actor_row_base = (
+                torch.arange(self.num_envs, device=device, dtype=torch.int32)
+                * self.actors_per_env
+            )
+
+    def get_actor_row_indices(self, actor_offset: int) -> torch.Tensor:
+        self._ensure_actor_row_base()
+        offset = int(actor_offset)
+        if offset < 0 or offset >= self.actors_per_env:
+            raise ValueError(f"actor_offset {actor_offset} out of range [0, {self.actors_per_env})")
+        return self._actor_row_base + offset
+
+    def get_extra_actor_offset(self, extra_index: int) -> int:
+        if self.extra_actors_per_env <= 0:
+            raise RuntimeError("No extra actors registered in this environment")
+        if extra_index < 0 or extra_index >= self.extra_actors_per_env:
+            raise IndexError(
+                f"extra_index {extra_index} invalid for {self.extra_actors_per_env} extra actors"
+            )
+        return self.actors_per_env - self.extra_actors_per_env + extra_index
+
+    def get_extra_actor_row_indices(self, extra_index: int) -> torch.Tensor:
+        offset = self.get_extra_actor_offset(extra_index)
+        return self.get_actor_row_indices(offset)
+
+    def get_extra_actor_state_view(self, extra_index: int) -> torch.Tensor:
+        offset = self.get_extra_actor_offset(extra_index)
+        return self.all_root_states[:, offset]
+
+    def set_extra_actor_states(self, extra_index: int, env_ids, new_states: torch.Tensor = None):
+        if self.extra_actors_per_env <= 0:
+            raise RuntimeError("set_extra_actor_states called but no extra actors are configured")
+
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        elif not torch.is_tensor(env_ids):
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        else:
+            env_ids = env_ids.to(device=self.device, dtype=torch.long)
+
+        if env_ids.numel() == 0:
+            return
+
+        offset = self.get_extra_actor_offset(extra_index)
+        if new_states is not None:
+            new_states = new_states.to(device=self.device)
+            self.all_root_states[env_ids, offset] = new_states
+
+        rows = self.get_actor_row_indices(offset).index_select(0, env_ids).contiguous()
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim,
+            self._root_state_ptr,
+            gymtorch.unwrap_tensor(rows),
+            rows.shape[0],
+        )
+        self.gym.refresh_actor_root_state_tensor(self.sim)
 
     # ======================== Marker 更新（给轨迹任务复用） ========================
     def update_markers(self, world_xyz: torch.Tensor):
