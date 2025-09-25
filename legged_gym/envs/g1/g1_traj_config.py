@@ -20,16 +20,33 @@ class G1TrajCfg(G1AMPCfg):
         accel_max = 1.0
         sharp_turn_prob = 0.2
         sharp_turn_angle = 1.57  # 90度
-        
+    class amp:
+        # Number of stacked AMP observation steps.  A single step keeps the
+        # implementation simple while remaining compatible with AMP training.
+        num_obs_steps = 1
+        # Whether to express AMP features in the local heading frame and
+        # whether to include the root height explicitly.
+        local_root_obs = True
+        root_height_obs = True
+        # Key bodies used for AMP features (typically the feet).
+        key_body_names = [
+            "left_ankle_roll_link",
+            "right_ankle_roll_link",
+        ]   
     class rewards(G1AMPCfg.rewards):
         class scales(G1AMPCfg.rewards.scales):
             tracking_lin_vel = 0.0
             tracking_ang_vel = 0.0
-            traj_tracking = 3.0
+            traj_tracking = 1.0
             traj_orientation = 0.0
-            smooth_motion = 0.5
+            smooth_motion = 0.0
 
 class G1TrajCfgPPO(G1AMPCfgPPO):
+    style_reward_weight = 0.5
+    task_reward_weight = 0.5
+    class algorithm(G1AMPCfgPPO.algorithm):
+        learning_rate = 3.0e-4
     class runner(G1AMPCfgPPO.runner):
+        debug_trajectory = False
         experiment_name = "g1_traj"
         max_iterations = 15000
