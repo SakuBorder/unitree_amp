@@ -15,9 +15,10 @@ class G1AMPCfg(G1RoughCfg):
         num_privileged_obs = G1RoughCfg.env.num_privileged_obs
 
     class amp:
-        # Number of stacked AMP observation steps.  A single step keeps the
-        # implementation simple while remaining compatible with AMP training.
-        num_obs_steps = 1
+        # Number of stacked AMP observation steps.  Four frames provide a short
+        # motion history for both the policy and discriminator while keeping the
+        # feature size manageable.
+        num_obs_steps = 4
         # Whether to express AMP features in the local heading frame and
         # whether to include the root height explicitly.
         local_root_obs = True

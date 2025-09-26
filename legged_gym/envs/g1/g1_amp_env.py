@@ -81,17 +81,35 @@ class G1AMPRobot(G1Robot):
         if self._motion_lib is None:
             raise RuntimeError("Motion library not initialised; set cfg.motion_lib.motion_file")
 
+        num_steps = int(self.cfg.amp.num_obs_steps)
+        if num_steps <= 0:
+            raise ValueError("cfg.amp.num_obs_steps must be a positive integer")
+        hist_dt = self.dt * max(num_steps - 1, 0)
+        truncate_time = delta_t + hist_dt
+
         motion_ids = self._motion_lib.sample_motions(num_samples)
-        motion_times0 = self._motion_lib.sample_time(motion_ids, truncate_time=delta_t)
-        motion_times1 = motion_times0 + delta_t
+        base_times = self._motion_lib.sample_time(
+            motion_ids, truncate_time=truncate_time if truncate_time > 0.0 else None
+        )
 
-        state0 = self._motion_lib.get_motion_state(motion_ids, motion_times0)
-        state1 = self._motion_lib.get_motion_state(motion_ids, motion_times1)
+        offsets = torch.arange(
+            num_steps,
+            device=base_times.device,
+            dtype=base_times.dtype,
+        )
+        offsets = hist_dt - offsets * self.dt
 
-        obs0 = self._build_amp_from_motion_state(state0)
-        obs1 = self._build_amp_from_motion_state(state1)
+        window_ids = motion_ids.unsqueeze(1).expand(-1, num_steps).reshape(-1)
+        window_times0 = (base_times.unsqueeze(1) + offsets).reshape(-1)
+        window_times1 = window_times0 + delta_t
 
-        return obs0, obs1
+        state0 = self._motion_lib.get_motion_state(window_ids, window_times0)
+        state1 = self._motion_lib.get_motion_state(window_ids, window_times1)
+
+        obs0 = self._build_amp_from_motion_state(state0).view(num_samples, num_steps, -1)
+        obs1 = self._build_amp_from_motion_state(state1).view(num_samples, num_steps, -1)
+
+        return obs0.view(num_samples, -1), obs1.view(num_samples, -1)
 
     # ------------------------------------------------------------------
     # Motion sampling utilities
