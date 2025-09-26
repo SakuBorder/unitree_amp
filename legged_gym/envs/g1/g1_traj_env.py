@@ -63,7 +63,7 @@ class G1TrajRobot(G1AMPRobot):
     # ----------------- 轨迹生成（对齐 HumanoidTraj） -----------------
     def _init_trajectory_generator(self):
         episode_dur = self.max_episode_length * self.dt
-        num_verts   = 101          # 100 段 ≈ 0.1s/段
+        num_verts   = 101          # 100 段 ≈0.1s/段
         dtheta_max  = 2.0
 
         self._traj_gen = TrajGenerator(
@@ -78,6 +78,13 @@ class G1TrajRobot(G1AMPRobot):
             sharp_turn_prob  = self.cfg.traj.sharp_turn_prob,
             sharp_turn_angle = getattr(self.cfg.traj, "sharp_turn_angle", math.pi),
         )
+
+        # 预计算可视化相关参数，便于随时间调整 marker 窗口
+        self._traj_duration    = episode_dur
+        self._traj_vert_dt     = episode_dur / float(num_verts - 1)
+        self._marker_speed_min = max(0.1, float(getattr(self.cfg.traj, "speed_min", 0.1)))
+        window = getattr(self.cfg.traj, "sample_timestep", 0.5) * max(1, getattr(self.cfg.traj, "num_samples", 1) - 1)
+        self._marker_max_lag   = max(window, 0.0)
 
         env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         init_pos = self.base_pos.clone()
@@ -105,6 +112,42 @@ class G1TrajRobot(G1AMPRobot):
         env_ids_tiled = torch.broadcast_to(env_ids.unsqueeze(-1), ts.shape)
         samples_flat  = self._traj_gen.calc_pos(env_ids_tiled.reshape(-1), ts.reshape(-1))
         return samples_flat.reshape(env_ids.shape[0], S, -1)                          # [n,S,3]
+
+    def _fetch_marker_samples(self, S: int, env_ids=None) -> torch.Tensor:
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        if env_ids.numel() == 0 or S <= 0:
+            return torch.zeros((env_ids.numel(), max(S, 0), 3), device=self.device, dtype=torch.float)
+
+        nominal_t = self.progress_buf[env_ids].float() * self.dt
+        start_t   = self._lag_adjusted_start_time(env_ids, nominal_t)
+
+        steps = torch.arange(S, device=self.device, dtype=torch.float) * self.cfg.traj.sample_timestep
+        ts    = start_t.unsqueeze(-1) + steps
+
+        env_ids_tiled = torch.broadcast_to(env_ids.unsqueeze(-1), ts.shape)
+        samples_flat  = self._traj_gen.calc_pos(env_ids_tiled.reshape(-1), ts.reshape(-1))
+        return samples_flat.reshape(env_ids.shape[0], S, -1)
+
+    def _lag_adjusted_start_time(self, env_ids: torch.Tensor, nominal_t: torch.Tensor) -> torch.Tensor:
+        if env_ids.numel() == 0:
+            return nominal_t
+
+        traj_pos = self._traj_gen.calc_pos(env_ids, nominal_t)
+        robot_xy = self.base_pos[env_ids, :2]
+        err_xy   = torch.norm(traj_pos[:, :2] - robot_xy, dim=-1)
+
+        next_t   = torch.clamp(nominal_t + self._traj_vert_dt, max=self._traj_duration)
+        next_pos = self._traj_gen.calc_pos(env_ids, next_t)
+        delta_t  = torch.clamp(next_t - nominal_t, min=1e-6)
+        exp_speed = torch.norm(next_pos[:, :2] - traj_pos[:, :2], dim=-1) / delta_t
+        exp_speed = torch.clamp(exp_speed, min=self._marker_speed_min)
+
+        lag = err_xy / exp_speed
+        if self._marker_max_lag > 0:
+            lag = torch.clamp(lag, max=self._marker_max_lag)
+
+        return torch.clamp(nominal_t - lag, min=0.0)
 
     def compute_observations(self):
         super().compute_observations()
@@ -178,7 +221,7 @@ class G1TrajRobot(G1AMPRobot):
         if getattr(self.cfg.traj, "enable_markers", False) and hasattr(self, "update_markers"):
             k = min(getattr(self, "num_markers", 0), self.cfg.traj.num_samples)
             if k > 0:
-                markers = self._fetch_traj_samples(k)
+                markers = self._fetch_marker_samples(k)
                 markers[..., 2] = self.cfg.rewards.base_height_target
                 self.update_markers(markers)
 

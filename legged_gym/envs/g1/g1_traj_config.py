@@ -42,11 +42,11 @@ class G1TrajCfg(G1AMPCfg):
             smooth_motion = 0.0
 
 class G1TrajCfgPPO(G1AMPCfgPPO):
-    style_reward_weight = 0.5
-    task_reward_weight = 0.5
+    style_reward_weight = 0.1
+    task_reward_weight = 0.9
     class algorithm(G1AMPCfgPPO.algorithm):
         learning_rate = 3.0e-4
     class runner(G1AMPCfgPPO.runner):
         debug_trajectory = False
         experiment_name = "g1_traj"
-        max_iterations = 15000
+        max_iterations = 50000

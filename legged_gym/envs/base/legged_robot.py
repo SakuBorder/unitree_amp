@@ -104,6 +104,7 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_net_contact_force_tensor(self.sim)
 
         self.episode_length_buf += 1
+        self.progress_buf += 1
         self.common_step_counter += 1
 
         # robot 根状态（all_root_states[:,0]）
@@ -158,6 +159,7 @@ class LeggedRobot(BaseTask):
         self.last_dof_vel[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
         self.episode_length_buf[env_ids] = 0
+        self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
 
         # 统计
